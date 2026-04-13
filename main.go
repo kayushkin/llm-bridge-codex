@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -25,6 +26,16 @@ func emitEvent(mu *sync.Mutex, enc *json.Encoder, event msg.Event) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-discover" {
+		sessions, err := discoverSessions()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "discover: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(sessions)
+		os.Exit(0)
+	}
+
 	// All log output goes to stderr — stdout is reserved for NDJSON events.
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
