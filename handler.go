@@ -18,8 +18,9 @@ type Bridge struct {
 	app       *AppServer
 	codex     *Codex
 	trans     *Translator
-	sessionID string
-	threadID  string // Codex thread ID for this session
+	bridgeID  string // server-assigned bridge_id (stable PK)
+	clientID  string // frontend correlation key
+	threadID  string // Codex thread ID — becomes the harness_id
 	turnDone  chan struct{}
 }
 
@@ -33,10 +34,32 @@ func NewBridge(cfg Config, emit func(msg.Event)) *Bridge {
 	return b
 }
 
+// currentSessionID returns the thread ID if known, otherwise the bridge ID.
+// This is the value emitted as SessionID on events — the server uses the first
+// event where SessionID != bridge_id to set harness_id.
+func (b *Bridge) currentSessionID() string {
+	if b.threadID != "" {
+		return b.threadID
+	}
+	return b.bridgeID
+}
+
+// event creates a base event with the correct session IDs populated.
+func (b *Bridge) event(typ msg.EventType) msg.Event {
+	return msg.Event{
+		Type:      typ,
+		Harness:   msg.HarnessCodex,
+		SessionID: b.currentSessionID(),
+		ClientID:  b.clientID,
+		Timestamp: time.Now(),
+	}
+}
+
 // Init starts the app-server, connects, authenticates, and registers handlers.
-func (b *Bridge) Init(ctx context.Context, sessionID string, emit func(msg.Event)) error {
-	b.sessionID = sessionID
-	b.trans = NewTranslator(sessionID, emit)
+func (b *Bridge) Init(ctx context.Context, sessionID, clientID string, emit func(msg.Event)) error {
+	b.bridgeID = sessionID
+	b.clientID = clientID
+	b.trans = NewTranslator(sessionID, clientID, emit)
 
 	// Register all notification → event translations.
 	b.trans.RegisterHandlers(b.app)
@@ -133,6 +156,7 @@ func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 			return fmt.Errorf("thread/fork: %w", err)
 		}
 		b.threadID = result.GetThreadID()
+		b.trans.SetSessionID(b.threadID)
 		log.Printf("[bridge] forked thread %s from %s", b.threadID, params.Fork)
 	} else {
 		result, err := b.codex.ThreadStart(ctx, &ThreadStartParams{
@@ -144,6 +168,7 @@ func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 			return fmt.Errorf("thread/start: %w", err)
 		}
 		b.threadID = result.GetThreadID()
+		b.trans.SetSessionID(b.threadID)
 		log.Printf("[bridge] started thread %s", b.threadID)
 	}
 
@@ -226,6 +251,7 @@ func (b *Bridge) Shutdown() {
 // StartParams matches the harness protocol start request.
 type StartParams struct {
 	SessionID   string `json:"session_id"`
+	ClientID    string `json:"client_id,omitempty"`
 	DisplayName string `json:"display_name,omitempty"`
 	AgentID     string `json:"agent_id,omitempty"`
 	Prompt      string `json:"prompt,omitempty"`

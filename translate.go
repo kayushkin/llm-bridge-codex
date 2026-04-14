@@ -14,7 +14,8 @@ import (
 // and emits them via the provided emit function.
 type Translator struct {
 	mu        sync.Mutex
-	sessionID string
+	sessionID string // harness session ID (thread ID once known, bridge ID before)
+	clientID  string // frontend correlation key (passed through unchanged)
 	emit      func(msg.Event)
 
 	// Per-turn accumulators.
@@ -25,9 +26,10 @@ type Translator struct {
 	finalAnswerIDs map[string]struct{}         // item IDs that are "final_answer" phase
 }
 
-func NewTranslator(sessionID string, emit func(msg.Event)) *Translator {
+func NewTranslator(sessionID, clientID string, emit func(msg.Event)) *Translator {
 	return &Translator{
 		sessionID:      sessionID,
+		clientID:       clientID,
 		emit:           emit,
 		text:           make(map[string]*strings.Builder),
 		toolCalls:      make(map[string]int),
@@ -36,11 +38,20 @@ func NewTranslator(sessionID string, emit func(msg.Event)) *Translator {
 	}
 }
 
+// SetSessionID updates the session ID emitted on events. Called once the
+// Codex thread ID is known — this becomes the harness_id on the server side.
+func (t *Translator) SetSessionID(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sessionID = id
+}
+
 func (t *Translator) event(typ msg.EventType) msg.Event {
 	return msg.Event{
 		Type:      typ,
 		Harness:   msg.HarnessCodex,
 		SessionID: t.sessionID,
+		ClientID:  t.clientID,
 		Timestamp: time.Now(),
 	}
 }

@@ -68,12 +68,7 @@ func main() {
 				if err := bridge.HandleInterrupt(ctx); err != nil {
 					log.Printf("interrupt: %v", err)
 				}
-				e := msg.Event{
-					Type:      msg.EventSessionState,
-					Harness:   msg.HarnessCodex,
-					SessionID: bridge.sessionID,
-					Timestamp: time.Now(),
-				}
+				e := bridge.event(msg.EventSessionState)
 				e.State = &msg.StateEvent{State: msg.SessionIdle}
 				emit(e)
 				continue
@@ -107,26 +102,26 @@ func main() {
 			var params StartParams
 			if err := json.Unmarshal(req.Params, &params); err != nil {
 				log.Printf("parse start params: %v", err)
-				emitError(emit, "", "INVALID_PARAMS", err.Error())
+				emitError(emit, "", "", "INVALID_PARAMS", err.Error())
 				continue
 			}
 
 			// Initialize bridge on first start request.
-			if err := bridge.Init(ctx, params.SessionID, emit); err != nil {
+			if err := bridge.Init(ctx, params.SessionID, params.ClientID, emit); err != nil {
 				log.Printf("init: %v", err)
-				emitError(emit, params.SessionID, "INIT_FAILED", err.Error())
+				emitError(emit, params.SessionID, params.ClientID, "INIT_FAILED", err.Error())
 				continue
 			}
 
 			if params.Resume {
 				if err := bridge.HandleResume(ctx); err != nil {
 					log.Printf("resume: %v", err)
-					emitError(emit, params.SessionID, "RESUME_FAILED", err.Error())
+					emitError(emit, bridge.currentSessionID(), bridge.clientID, "RESUME_FAILED", err.Error())
 				}
 			} else {
 				if err := bridge.HandleStart(ctx, params); err != nil {
 					log.Printf("start: %v", err)
-					emitError(emit, params.SessionID, "START_FAILED", err.Error())
+					emitError(emit, bridge.currentSessionID(), bridge.clientID, "START_FAILED", err.Error())
 				}
 			}
 
@@ -134,25 +129,25 @@ func main() {
 			var params MessageParams
 			if err := json.Unmarshal(req.Params, &params); err != nil {
 				log.Printf("parse message params: %v", err)
-				emitError(emit, bridge.sessionID, "INVALID_PARAMS", err.Error())
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "INVALID_PARAMS", err.Error())
 				continue
 			}
 
 			if err := bridge.HandleMessage(ctx, params.Content); err != nil {
 				log.Printf("message: %v", err)
-				emitError(emit, bridge.sessionID, "MESSAGE_FAILED", err.Error())
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "MESSAGE_FAILED", err.Error())
 			}
 
 		case "compact":
 			if err := bridge.HandleCompact(ctx); err != nil {
 				log.Printf("compact: %v", err)
-				emitError(emit, bridge.sessionID, "COMPACT_FAILED", err.Error())
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "COMPACT_FAILED", err.Error())
 			}
 
 		case "resume":
 			if err := bridge.HandleResume(ctx); err != nil {
 				log.Printf("resume: %v", err)
-				emitError(emit, bridge.sessionID, "RESUME_FAILED", err.Error())
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "RESUME_FAILED", err.Error())
 			}
 
 		default:
@@ -169,12 +164,13 @@ func main() {
 	bridge.Shutdown()
 }
 
-func emitError(emit func(msg.Event), sessionID, code, message string) {
+func emitError(emit func(msg.Event), sessionID, clientID, code, message string) {
 	now := time.Now()
 	e := msg.Event{
 		Type:      msg.EventError,
 		Harness:   msg.HarnessCodex,
 		SessionID: sessionID,
+		ClientID:  clientID,
 		Timestamp: now,
 	}
 	e.Error = &msg.ErrorEvent{Code: code, Message: message}
@@ -184,6 +180,7 @@ func emitError(emit func(msg.Event), sessionID, code, message string) {
 		Type:      msg.EventSessionState,
 		Harness:   msg.HarnessCodex,
 		SessionID: sessionID,
+		ClientID:  clientID,
 		Timestamp: now,
 	}
 	se.State = &msg.StateEvent{State: msg.SessionError}
