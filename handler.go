@@ -259,6 +259,25 @@ func (b *Bridge) HandleSetPermissionMode(mode string) {
 	log.Printf("[bridge] approval mode changed to %s", mode)
 }
 
+// HandleConfig handles mid-session config updates (config:<json> method).
+func (b *Bridge) HandleConfig(configJSON string) {
+	var cfg struct {
+		Model  string `json:"model,omitempty"`
+		Effort string `json:"effort,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		log.Printf("[bridge] parse config: %v", err)
+		return
+	}
+	if cfg.Model != "" {
+		b.HandleSetModel(cfg.Model)
+	}
+	if cfg.Effort != "" {
+		b.cfg.Effort = cfg.Effort
+		log.Printf("[bridge] effort changed to %s", cfg.Effort)
+	}
+}
+
 // HandleControl dispatches generic control commands.
 func (b *Bridge) HandleControl(ctx context.Context, params ControlParams) error {
 	switch params.Subtype {

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -181,7 +182,13 @@ func main() {
 			}
 
 		default:
-			log.Printf("unknown method: %s", req.Method)
+			// Handle config:<json> method (sent by llm-bridge-server for mid-session config).
+			if strings.HasPrefix(req.Method, "config:") {
+				configJSON := req.Method[len("config:"):]
+				bridge.HandleConfig(configJSON)
+			} else {
+				log.Printf("unknown method: %s", req.Method)
+			}
 		}
 	}
 
