@@ -50,6 +50,7 @@ func (b *Bridge) event(typ msg.EventType) msg.Event {
 		Type:      typ,
 		Harness:   msg.HarnessCodex,
 		SessionID: b.currentSessionID(),
+		BridgeID:  b.bridgeID,
 		ClientID:  b.clientID,
 		Timestamp: time.Now(),
 	}
@@ -149,6 +150,27 @@ func (b *Bridge) initAuth(ctx context.Context) error {
 
 // HandleStart creates a new thread and starts the first turn.
 func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
+	// Apply start-time overrides from params.
+	if params.Model != "" {
+		b.cfg.CodexModel = params.Model
+	}
+	if params.WorkDir != "" {
+		b.cfg.CodexWorkdir = params.WorkDir
+	}
+	if params.ApprovalMode != "" {
+		b.cfg.ApprovalMode = params.ApprovalMode
+	}
+	if params.Sandbox != "" {
+		b.cfg.SandboxPolicy = params.Sandbox
+	}
+	if params.Effort != "" {
+		b.cfg.Effort = params.Effort
+	}
+	if params.AutoApprove != nil && *params.AutoApprove {
+		b.cfg.ApprovalMode = "never"
+		b.cfg.SandboxPolicy = "workspace-write"
+	}
+
 	// If forking from a parent session, use thread/fork.
 	if params.Fork != "" {
 		result, err := b.codex.ThreadFork(ctx, &ThreadForkParams{ThreadID: params.Fork})
@@ -160,9 +182,11 @@ func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 		log.Printf("[bridge] forked thread %s from %s", b.threadID, params.Fork)
 	} else {
 		result, err := b.codex.ThreadStart(ctx, &ThreadStartParams{
-			Model:          b.cfg.CodexModel,
-			ApprovalPolicy: b.cfg.ApprovalMode,
-			Cwd:            b.cfg.CodexWorkdir,
+			Model:                 b.cfg.CodexModel,
+			ApprovalPolicy:        b.cfg.ApprovalMode,
+			Sandbox:               b.cfg.SandboxPolicy,
+			Cwd:                   b.cfg.CodexWorkdir,
+			DeveloperInstructions: params.SystemPrompt,
 		})
 		if err != nil {
 			return fmt.Errorf("thread/start: %w", err)
@@ -187,11 +211,23 @@ func (b *Bridge) HandleMessage(ctx context.Context, content string) error {
 	return b.startTurn(ctx, content)
 }
 
-// HandleResume resumes a previously interrupted thread.
+// HandleResume resumes a previously interrupted thread by sending a continuation prompt.
 func (b *Bridge) HandleResume(ctx context.Context) error {
 	if b.threadID == "" {
 		return fmt.Errorf("no active thread")
 	}
+	return b.startTurn(ctx, "Continue where you left off.")
+}
+
+// HandleResumeThread resumes an existing thread by ID using the ThreadResume API.
+func (b *Bridge) HandleResumeThread(ctx context.Context, threadID string) error {
+	result, err := b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: threadID})
+	if err != nil {
+		return fmt.Errorf("thread/resume: %w", err)
+	}
+	b.threadID = result.GetThreadID()
+	b.trans.SetSessionID(b.threadID)
+	log.Printf("[bridge] resumed thread %s", b.threadID)
 	return b.startTurn(ctx, "Continue where you left off.")
 }
 
@@ -211,6 +247,57 @@ func (b *Bridge) HandleInterrupt(ctx context.Context) error {
 	return b.codex.TurnInterrupt(ctx, &TurnInterruptParams{ThreadID: b.threadID})
 }
 
+// HandleSetModel changes the model used for subsequent turns.
+func (b *Bridge) HandleSetModel(model string) {
+	b.cfg.CodexModel = model
+	log.Printf("[bridge] model changed to %s", model)
+}
+
+// HandleSetPermissionMode changes the approval policy for subsequent turns.
+func (b *Bridge) HandleSetPermissionMode(mode string) {
+	b.cfg.ApprovalMode = mode
+	log.Printf("[bridge] approval mode changed to %s", mode)
+}
+
+// HandleControl dispatches generic control commands.
+func (b *Bridge) HandleControl(ctx context.Context, params ControlParams) error {
+	switch params.Subtype {
+	case "set_model":
+		if m, ok := params.Payload["model"]; ok {
+			b.HandleSetModel(m)
+		}
+		return nil
+	case "set_permission_mode":
+		if m, ok := params.Payload["mode"]; ok {
+			b.HandleSetPermissionMode(m)
+		}
+		return nil
+	case "interrupt":
+		return b.HandleInterrupt(ctx)
+	default:
+		log.Printf("[bridge] unknown control subtype: %s", params.Subtype)
+		return nil
+	}
+}
+
+// sandboxModeToPolicy converts user-facing sandbox mode strings to the tagged enum
+// format required by turn/start. Thread/start uses the string directly (SandboxMode).
+func sandboxModeToPolicy(mode string) *SandboxPolicy {
+	switch mode {
+	case "workspace-write":
+		return &SandboxPolicy{Type: "workspaceWrite"}
+	case "read-only":
+		return &SandboxPolicy{Type: "readOnly"}
+	case "danger-full-access":
+		return &SandboxPolicy{Type: "dangerFullAccess"}
+	default:
+		if mode != "" {
+			return &SandboxPolicy{Type: mode}
+		}
+		return nil
+	}
+}
+
 func (b *Bridge) startTurn(ctx context.Context, prompt string) error {
 	// Drain any stale turnDone signals.
 	select {
@@ -223,6 +310,8 @@ func (b *Bridge) startTurn(ctx context.Context, prompt string) error {
 		Input:          TextInput(prompt),
 		Model:          b.cfg.CodexModel,
 		ApprovalPolicy: b.cfg.ApprovalMode,
+		SandboxPolicy:  sandboxModeToPolicy(b.cfg.SandboxPolicy),
+		Effort:         b.cfg.Effort,
 	}); err != nil {
 		return fmt.Errorf("turn/start: %w", err)
 	}
@@ -250,16 +339,39 @@ func (b *Bridge) Shutdown() {
 
 // StartParams matches the harness protocol start request.
 type StartParams struct {
-	SessionID   string `json:"session_id"`
-	ClientID    string `json:"client_id,omitempty"`
-	DisplayName string `json:"display_name,omitempty"`
-	AgentID     string `json:"agent_id,omitempty"`
-	Prompt      string `json:"prompt,omitempty"`
-	Resume      bool   `json:"resume,omitempty"`
-	Fork        string `json:"fork,omitempty"`
+	SessionID      string `json:"session_id"`
+	ClientID       string `json:"client_id,omitempty"`
+	DisplayName    string `json:"display_name,omitempty"`
+	AgentID        string `json:"agent_id,omitempty"`
+	Prompt         string `json:"prompt,omitempty"`
+	Resume         bool   `json:"resume,omitempty"`
+	Fork           string `json:"fork,omitempty"`
+	Model          string `json:"model,omitempty"`
+	WorkDir        string `json:"work_dir,omitempty"`
+	ApprovalMode   string `json:"permission_mode,omitempty"`
+	Sandbox        string `json:"sandbox,omitempty"`
+	SystemPrompt   string `json:"system_prompt,omitempty"`
+	Effort         string `json:"effort,omitempty"`
+	AutoApprove    *bool  `json:"auto_approve,omitempty"`
 }
 
 // MessageParams matches the harness protocol message request.
 type MessageParams struct {
 	Content string `json:"content"`
+}
+
+// SetModelParams matches the harness protocol set_model request.
+type SetModelParams struct {
+	Model string `json:"model"`
+}
+
+// SetPermissionModeParams matches the harness protocol set_permission_mode request.
+type SetPermissionModeParams struct {
+	Mode string `json:"mode"`
+}
+
+// ControlParams matches the harness protocol control request.
+type ControlParams struct {
+	Subtype string            `json:"subtype"`
+	Payload map[string]string `json:"payload,omitempty"`
 }

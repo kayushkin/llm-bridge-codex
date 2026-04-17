@@ -43,8 +43,8 @@ func main() {
 
 	cfg := loadConfig()
 
-	log.Printf("starting: codex=%s port=%d workdir=%s model=%s approval=%s",
-		cfg.CodexPath, cfg.CodexWSPort, cfg.CodexWorkdir, cfg.CodexModel, cfg.ApprovalMode)
+	log.Printf("starting: codex=%s port=%d workdir=%s model=%s approval=%s sandbox=%s effort=%s",
+		cfg.CodexPath, cfg.CodexWSPort, cfg.CodexWorkdir, cfg.CodexModel, cfg.ApprovalMode, cfg.SandboxPolicy, cfg.Effort)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -114,7 +114,7 @@ func main() {
 			}
 
 			if params.Resume {
-				if err := bridge.HandleResume(ctx); err != nil {
+				if err := bridge.HandleResumeThread(ctx, params.SessionID); err != nil {
 					log.Printf("resume: %v", err)
 					emitError(emit, bridge.currentSessionID(), bridge.clientID, "RESUME_FAILED", err.Error())
 				}
@@ -150,6 +150,36 @@ func main() {
 				emitError(emit, bridge.currentSessionID(), bridge.clientID, "RESUME_FAILED", err.Error())
 			}
 
+		case "set_model":
+			var params SetModelParams
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				log.Printf("parse set_model params: %v", err)
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "INVALID_PARAMS", err.Error())
+				continue
+			}
+			bridge.HandleSetModel(params.Model)
+
+		case "set_permission_mode":
+			var params SetPermissionModeParams
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				log.Printf("parse set_permission_mode params: %v", err)
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "INVALID_PARAMS", err.Error())
+				continue
+			}
+			bridge.HandleSetPermissionMode(params.Mode)
+
+		case "control":
+			var params ControlParams
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				log.Printf("parse control params: %v", err)
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "INVALID_PARAMS", err.Error())
+				continue
+			}
+			if err := bridge.HandleControl(ctx, params); err != nil {
+				log.Printf("control: %v", err)
+				emitError(emit, bridge.currentSessionID(), bridge.clientID, "CONTROL_FAILED", err.Error())
+			}
+
 		default:
 			log.Printf("unknown method: %s", req.Method)
 		}
@@ -166,23 +196,20 @@ func main() {
 
 func emitError(emit func(msg.Event), sessionID, clientID, code, message string) {
 	now := time.Now()
-	e := msg.Event{
+	emit(msg.Event{
 		Type:      msg.EventError,
 		Harness:   msg.HarnessCodex,
 		SessionID: sessionID,
 		ClientID:  clientID,
 		Timestamp: now,
-	}
-	e.Error = &msg.ErrorEvent{Code: code, Message: message}
-	emit(e)
-
-	se := msg.Event{
+		Error:     &msg.ErrorEvent{Code: code, Message: message},
+	})
+	emit(msg.Event{
 		Type:      msg.EventSessionState,
 		Harness:   msg.HarnessCodex,
 		SessionID: sessionID,
 		ClientID:  clientID,
 		Timestamp: now,
-	}
-	se.State = &msg.StateEvent{State: msg.SessionError}
-	emit(se)
+		State:     &msg.StateEvent{State: msg.SessionError},
+	})
 }

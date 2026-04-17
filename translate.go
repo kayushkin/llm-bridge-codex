@@ -15,6 +15,7 @@ import (
 type Translator struct {
 	mu        sync.Mutex
 	sessionID string // harness session ID (thread ID once known, bridge ID before)
+	bridgeID  string // server-assigned bridge_id (stable PK)
 	clientID  string // frontend correlation key (passed through unchanged)
 	emit      func(msg.Event)
 
@@ -22,13 +23,14 @@ type Translator struct {
 	text           map[string]*strings.Builder // threadID → accumulated text
 	toolCalls      map[string]int              // threadID → tool count
 	usage          map[string]*msg.TokenUsage  // threadID → latest usage
-	model          string                      // current model (from thread info)
+	model          string                      // current model (from thread info or turn completion)
 	finalAnswerIDs map[string]struct{}         // item IDs that are "final_answer" phase
 }
 
 func NewTranslator(sessionID, clientID string, emit func(msg.Event)) *Translator {
 	return &Translator{
 		sessionID:      sessionID,
+		bridgeID:       sessionID,
 		clientID:       clientID,
 		emit:           emit,
 		text:           make(map[string]*strings.Builder),
@@ -51,6 +53,7 @@ func (t *Translator) event(typ msg.EventType) msg.Event {
 		Type:      typ,
 		Harness:   msg.HarnessCodex,
 		SessionID: t.sessionID,
+		BridgeID:  t.bridgeID,
 		ClientID:  t.clientID,
 		Timestamp: time.Now(),
 	}
@@ -163,15 +166,20 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
+		// Update model from turn completion if provided.
+		if n.Model != "" {
+			t.model = n.Model
+		}
 		finalText := t.accumulatedText(n.ThreadID)
 		usage := t.getUsage(n.ThreadID)
+		toolCount := t.toolCallCount(n.ThreadID)
 
 		// Emit result event with usage from thread/tokenUsage/updated.
 		e := t.event(msg.EventResult)
 		e.Result = &msg.ResultEvent{
 			Text:       finalText,
 			NumTurns:   1,
-			APICalls:   1,
+			APICalls:   toolCount + 1,
 			Model:      t.model,
 			DurationMS: int64(n.Turn.DurationMs),
 			Usage:      usage,
@@ -329,8 +337,22 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	srv.OnNotification("item/commandExecution/outputDelta", func(_ string, params json.RawMessage) {
-		// Output deltas are available for streaming but not mapped to a canonical event.
-		// Consumers can use the raw field if needed.
+		var n CommandExecutionOutputDeltaNotification
+		if err := json.Unmarshal(params, &n); err != nil {
+			return
+		}
+		e := t.event(msg.EventStream)
+		e.Stream = &msg.HarnessStream{
+			Delta: &msg.BlockDelta{
+				Index: 0,
+				Type:  msg.DeltaText,
+				Text:  n.Delta,
+			},
+			MessageID: n.ItemID,
+			Hidden:    true,
+		}
+		e.Raw = params
+		t.emit(e)
 	})
 
 	srv.OnNotification("item/commandExecution/completed", func(_ string, params json.RawMessage) {
@@ -371,7 +393,22 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	srv.OnNotification("item/fileChange/outputDelta", func(_ string, params json.RawMessage) {
-		// Diff deltas available in raw.
+		var n FileChangeOutputDeltaNotification
+		if err := json.Unmarshal(params, &n); err != nil {
+			return
+		}
+		e := t.event(msg.EventStream)
+		e.Stream = &msg.HarnessStream{
+			Delta: &msg.BlockDelta{
+				Index: 0,
+				Type:  msg.DeltaText,
+				Text:  n.Delta,
+			},
+			MessageID: n.ItemID,
+			Hidden:    true,
+		}
+		e.Raw = params
+		t.emit(e)
 	})
 
 	srv.OnNotification("item/fileChange/completed", func(_ string, params json.RawMessage) {
@@ -517,6 +554,126 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		e.Raw = params
 		t.emit(e)
 	})
+
+	// --- Top-level error ---
+	srv.OnNotification("error", func(_ string, params json.RawMessage) {
+		var n struct {
+			Message string `json:"message"`
+			Code    string `json:"code,omitempty"`
+		}
+		if err := json.Unmarshal(params, &n); err != nil {
+			return
+		}
+		code := n.Code
+		if code == "" {
+			code = "SERVER_ERROR"
+		}
+		e := t.event(msg.EventError)
+		e.Error = &msg.ErrorEvent{Code: code, Message: n.Message}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- Hook lifecycle ---
+	srv.OnNotification("hook/started", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "hook_started"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	srv.OnNotification("hook/completed", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "hook_completed"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- Turn diff/plan updates ---
+	srv.OnNotification("turn/diff/updated", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "turn_diff_updated"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	srv.OnNotification("turn/plan/updated", func(_ string, params json.RawMessage) {
+		var n struct {
+			Plan string `json:"plan,omitempty"`
+		}
+		if err := json.Unmarshal(params, &n); err != nil {
+			return
+		}
+		e := t.event(msg.EventPlan)
+		e.Plan = &msg.PlanEvent{Text: n.Plan}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- Thread compaction completed ---
+	srv.OnNotification("thread/compacted", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "thread_compacted"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- Model rerouted ---
+	srv.OnNotification("model/rerouted", func(_ string, params json.RawMessage) {
+		var n struct {
+			Model string `json:"model,omitempty"`
+		}
+		if err := json.Unmarshal(params, &n); err != nil {
+			return
+		}
+		if n.Model != "" {
+			t.model = n.Model
+		}
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "model_rerouted", Message: n.Model}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- Auto-approval review ---
+	srv.OnNotification("item/autoApprovalReview/started", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "auto_approval_review_started"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	srv.OnNotification("item/autoApprovalReview/completed", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "auto_approval_review_completed"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- MCP tool call progress ---
+	srv.OnNotification("item/mcpToolCall/progress", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "mcp_tool_call_progress"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- Reasoning summary part added ---
+	srv.OnNotification("item/reasoning/summaryPartAdded", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "reasoning_summary_part_added"}
+		e.Raw = params
+		t.emit(e)
+	})
+
+	// --- Command execution terminal interaction ---
+	srv.OnNotification("item/commandExecution/terminalInteraction", func(_ string, params json.RawMessage) {
+		e := t.event(msg.EventSystem)
+		e.System = &msg.SystemEvent{Subtype: "terminal_interaction"}
+		e.Raw = params
+		t.emit(e)
+	})
+
 }
 
 // RegisterApprovalHandlers sets up auto-approve for all server→client requests.
@@ -575,6 +732,41 @@ func (t *Translator) RegisterApprovalHandlers(srv *AppServer) {
 			Status:      "approved",
 			ToolName:    "permissions",
 			Permissions: req.Permissions,
+		}
+		e.Raw = params
+		t.emit(e)
+
+		return json.Marshal(ApprovalResponse{Approved: true})
+	})
+
+	srv.OnRequest("applyPatchApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
+		log.Printf("[approval] auto-approve apply patch")
+
+		e := t.event(msg.EventApproval)
+		e.Approval = &msg.ApprovalEvent{
+			Action:   "approve",
+			Status:   "approved",
+			ToolName: "apply_patch",
+		}
+		e.Raw = params
+		t.emit(e)
+
+		return json.Marshal(ApprovalResponse{Approved: true})
+	})
+
+	srv.OnRequest("execCommandApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
+		var req struct {
+			Command string `json:"command,omitempty"`
+		}
+		_ = json.Unmarshal(params, &req)
+		log.Printf("[approval] auto-approve exec command: %s", truncate(req.Command, 120))
+
+		e := t.event(msg.EventApproval)
+		e.Approval = &msg.ApprovalEvent{
+			Action:   "approve",
+			Status:   "approved",
+			ToolName: "exec_command",
+			Command:  req.Command,
 		}
 		e.Raw = params
 		t.emit(e)

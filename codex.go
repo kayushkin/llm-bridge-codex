@@ -44,10 +44,14 @@ func callTyped[T any](c *Codex, ctx context.Context, method string, params any) 
 // ---------------------------------------------------------------------------
 
 type ThreadStartParams struct {
-	Model          string `json:"model,omitempty"`
-	ApprovalPolicy string `json:"approvalPolicy,omitempty"`
-	SandboxPolicy  string `json:"sandbox,omitempty"`
-	Cwd            string `json:"cwd,omitempty"`
+	Model                 string `json:"model,omitempty"`
+	ModelProvider         string `json:"modelProvider,omitempty"`
+	ApprovalPolicy        string `json:"approvalPolicy,omitempty"`
+	Sandbox               string `json:"sandbox,omitempty"`
+	Cwd                   string `json:"cwd,omitempty"`
+	DeveloperInstructions string `json:"developerInstructions,omitempty"`
+	BaseInstructions      string `json:"baseInstructions,omitempty"`
+	Ephemeral             *bool  `json:"ephemeral,omitempty"`
 }
 
 type ThreadStartResult struct {
@@ -126,13 +130,18 @@ func (c *Codex) ThreadCompactStart(ctx context.Context, params *ThreadCompactPar
 // Turn control
 // ---------------------------------------------------------------------------
 
+// SandboxPolicy is the tagged enum for turn-level sandbox configuration.
+type SandboxPolicy struct {
+	Type string `json:"type"`
+}
+
 type TurnStartParams struct {
-	ThreadID       string `json:"threadId"`
-	Input          any    `json:"input"`
-	Model          string `json:"model,omitempty"`
-	ApprovalPolicy string `json:"approvalPolicy,omitempty"`
-	Sandbox        string `json:"sandbox,omitempty"`
-	Effort         string `json:"effort,omitempty"`
+	ThreadID       string         `json:"threadId"`
+	Input          any            `json:"input"`
+	Model          string         `json:"model,omitempty"`
+	ApprovalPolicy string         `json:"approvalPolicy,omitempty"`
+	SandboxPolicy  *SandboxPolicy `json:"sandboxPolicy,omitempty"`
+	Effort         string         `json:"effort,omitempty"`
 }
 
 type TurnInputItem struct {
