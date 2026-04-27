@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -26,7 +27,35 @@ func emitEvent(mu *sync.Mutex, enc *json.Encoder, event msg.Event) {
 	}
 }
 
+// execCodexPTY replaces this process with the upstream `codex` CLI so the
+// inherited pseudoterminal is wired straight through to its native TUI. The
+// caller (llm-bridge-server.StartProcessPTY) already set the harness's auth
+// path env (and inherited cwd); pty mode bypasses the AppServer/WebSocket
+// path entirely so the user gets the unmodified `codex` experience.
+func execCodexPTY() {
+	cfg := loadConfig()
+	bin, err := exec.LookPath(cfg.CodexPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "llm-bridge-codex pty: codex binary not found at %q: %v\n", cfg.CodexPath, err)
+		os.Exit(127)
+	}
+	if err := syscall.Exec(bin, []string{bin}, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "llm-bridge-codex pty: exec %s: %v\n", bin, err)
+		os.Exit(127)
+	}
+}
+
 func main() {
+	// PTY mode hand-off. llm-bridge-server's StartProcessPTY launches us
+	// inside a pseudoterminal with LLMBRIDGE_PTY_MODE=1; the contract is
+	// that we exec into the upstream `codex` CLI so the pty fd connects
+	// directly to its TUI. The harness wrapper has nothing to do in pty
+	// mode — there's no AppServer connection, no msg.Event translation.
+	if os.Getenv("LLMBRIDGE_PTY_MODE") == "1" {
+		execCodexPTY()
+		return
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "-discover" {
 		sessions, err := discoverSessions()
 		if err != nil {
