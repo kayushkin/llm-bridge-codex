@@ -50,12 +50,12 @@ func (t *Translator) SetSessionID(id string) {
 
 func (t *Translator) event(typ msg.EventType) msg.Event {
 	return msg.Event{
-		Type:      typ,
-		Harness:   msg.HarnessCodex,
-		SessionID: t.sessionID,
-		BridgeID:  t.bridgeID,
-		ClientID:  t.clientID,
-		Timestamp: time.Now(),
+		Type:             typ,
+		Harness:          msg.HarnessCodex,
+		BridgeSessionID:  t.bridgeID,
+		HarnessSessionID: t.sessionID,
+		ClientID:         t.clientID,
+		Timestamp:        time.Now(),
 	}
 }
 

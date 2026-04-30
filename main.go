@@ -136,10 +136,15 @@ func main() {
 				continue
 			}
 
-			// Initialize bridge on first start request.
-			if err := bridge.Init(ctx, params.SessionID, params.ClientID, emit); err != nil {
+			// Prefer the new BridgeSessionID; fall back to legacy SessionID
+			// for older bridge-server binaries.
+			bsid := params.BridgeSessionID
+			if bsid == "" {
+				bsid = params.SessionID
+			}
+			if err := bridge.Init(ctx, bsid, params.ClientID, emit); err != nil {
 				log.Printf("init: %v", err)
-				emitError(emit, params.SessionID, params.ClientID, "INIT_FAILED", err.Error())
+				emitError(emit, bsid, params.ClientID, "INIT_FAILED", err.Error())
 				continue
 			}
 
@@ -232,20 +237,24 @@ func main() {
 
 func emitError(emit func(msg.Event), sessionID, clientID, code, message string) {
 	now := time.Now()
+	// On init-failed paths sessionID may be the bridge id we received in
+	// StartParams; mirror it onto both fields so bridge-server can route.
 	emit(msg.Event{
-		Type:      msg.EventError,
-		Harness:   msg.HarnessCodex,
-		SessionID: sessionID,
-		ClientID:  clientID,
-		Timestamp: now,
-		Error:     &msg.ErrorEvent{Code: code, Message: message},
+		Type:             msg.EventError,
+		Harness:          msg.HarnessCodex,
+		BridgeSessionID:  sessionID,
+		HarnessSessionID: sessionID,
+		ClientID:         clientID,
+		Timestamp:        now,
+		Error:            &msg.ErrorEvent{Code: code, Message: message},
 	})
 	emit(msg.Event{
-		Type:      msg.EventSessionState,
-		Harness:   msg.HarnessCodex,
-		SessionID: sessionID,
-		ClientID:  clientID,
-		Timestamp: now,
-		State:     &msg.StateEvent{State: msg.SessionError},
+		Type:             msg.EventSessionState,
+		Harness:          msg.HarnessCodex,
+		BridgeSessionID:  sessionID,
+		HarnessSessionID: sessionID,
+		ClientID:         clientID,
+		Timestamp:        now,
+		State:            &msg.StateEvent{State: msg.SessionError},
 	})
 }

@@ -13,6 +13,13 @@ import (
 
 // discoverSessions scans Codex's on-disk session storage and returns all found sessions.
 // Sessions are stored at ~/.codex/sessions/<year>/<month>/<day>/rollout-<timestamp>-<uuid>.jsonl
+//
+// Rollouts that the bridge has already chained in state.db (i.e. they're a
+// resume/fork continuation of a known bridge_session_id, not the originating
+// rollout) are skipped — they belong to their parent ManagedSession on the
+// bridge-server side and should not appear as standalone entries. Cold
+// rollouts that aren't in state.db pass through unchanged so existing
+// pre-fix data still surfaces.
 func discoverSessions() ([]msg.StoredSession, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -20,6 +27,27 @@ func discoverSessions() ([]msg.StoredSession, error) {
 	}
 
 	sessionsDir := filepath.Join(home, ".codex", "sessions")
+
+	// Build the set of harness_session_ids that state.db has chained as
+	// non-originating rollouts (sequence > 0). These are stub continuations
+	// and should be hidden from the discover output. If state.db can't be
+	// opened for any reason we proceed without filtering — fail-safe toward
+	// surfacing rollouts rather than losing them.
+	chained := map[string]string{} // thread_id → bridge_session_id (sequence > 0 only)
+	if st, err := OpenState(DefaultStatePath()); err == nil {
+		defer st.Close()
+		if all, err := st.AllSessions(); err == nil {
+			for _, s := range all {
+				if rs, err := st.ListRollouts(s.BridgeSessionID); err == nil {
+					for _, r := range rs {
+						if r.Sequence > 0 {
+							chained[r.HarnessSessionID] = s.BridgeSessionID
+						}
+					}
+				}
+			}
+		}
+	}
 
 	var sessions []msg.StoredSession
 
@@ -60,6 +88,14 @@ func discoverSessions() ([]msg.StoredSession, error) {
 		// Format: rollout-<timestamp>-<uuid>.jsonl
 		if sess.ID == "" {
 			sess.ID = extractIDFromFilename(d.Name())
+		}
+
+		// Skip rollouts that state.db knows are non-originating continuations
+		// (resume/fork sequence > 0). They belong to their parent
+		// bridge_session_id and shouldn't appear as standalone discovered
+		// sessions — that's how the stub-rollout problem stops surfacing.
+		if _, isChain := chained[sess.ID]; isChain {
+			return nil
 		}
 
 		sessions = append(sessions, sess)
@@ -170,6 +206,33 @@ func extractIDFromFilename(name string) string {
 		}
 	}
 	return name
+}
+
+// findRolloutForThread does a best-effort scan of ~/.codex/sessions/ for a
+// rollout file whose name carries the given thread_id. Returns "" if not
+// found — caller treats that as "rollout file not yet on disk" and proceeds
+// without the path. The path can be backfilled later by re-globbing.
+func findRolloutForThread(threadID string) string {
+	if threadID == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	sessionsDir := filepath.Join(home, ".codex", "sessions")
+	var found string
+	_ = filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".jsonl") && strings.Contains(d.Name(), threadID) {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // truncateStr truncates a string to max bytes.

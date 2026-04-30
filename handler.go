@@ -14,14 +14,15 @@ import (
 
 // Bridge holds the state for one session managed by this process.
 type Bridge struct {
-	cfg       Config
-	app       *AppServer
-	codex     *Codex
-	trans     *Translator
-	bridgeID  string // server-assigned bridge_id (stable PK)
-	clientID  string // frontend correlation key
-	threadID  string // Codex thread ID — becomes the harness_id
-	turnDone  chan struct{}
+	cfg      Config
+	app      *AppServer
+	codex    *Codex
+	trans    *Translator
+	state    *State // local persistent chain (sessions/rollouts/wal)
+	bridgeID string // server-assigned bridge_session_id (stable PK)
+	clientID string // frontend correlation key
+	threadID string // current Codex thread ID — the harness_session_id; rotates on resume/fork
+	turnDone chan struct{}
 }
 
 func NewBridge(cfg Config, emit func(msg.Event)) *Bridge {
@@ -44,15 +45,18 @@ func (b *Bridge) currentSessionID() string {
 	return b.bridgeID
 }
 
-// event creates a base event with the correct session IDs populated.
+// event creates a base event with the correct session IDs populated. New
+// fields (BridgeSessionID/HarnessSessionID) are stamped alongside their legacy
+// mirrors (BridgeID/SessionID) so consumers on either side of the rename
+// rollout see consistent values.
 func (b *Bridge) event(typ msg.EventType) msg.Event {
 	return msg.Event{
-		Type:      typ,
-		Harness:   msg.HarnessCodex,
-		SessionID: b.currentSessionID(),
-		BridgeID:  b.bridgeID,
-		ClientID:  b.clientID,
-		Timestamp: time.Now(),
+		Type:             typ,
+		Harness:          msg.HarnessCodex,
+		BridgeSessionID:  b.bridgeID,
+		HarnessSessionID: b.threadID,
+		ClientID:         b.clientID,
+		Timestamp:        time.Now(),
 	}
 }
 
@@ -61,6 +65,39 @@ func (b *Bridge) Init(ctx context.Context, sessionID, clientID string, emit func
 	b.bridgeID = sessionID
 	b.clientID = clientID
 	b.trans = NewTranslator(sessionID, clientID, emit)
+
+	// Open the local chain store. Failure here is fatal — without state.db we
+	// can't track resume chains and would silently regress to the
+	// stub-rollout problem.
+	st, err := OpenState(DefaultStatePath())
+	if err != nil {
+		return fmt.Errorf("open state.db: %w", err)
+	}
+	b.state = st
+
+	// Reconcile any WAL rows left pending by a previous crash. Mark them
+	// orphaned so they don't block future operations. Operator can recover
+	// the orphan rollout files manually if needed (see ARCHITECTURE.md
+	// "Resume flow" — crash window).
+	pending, err := b.state.ListPendingWAL()
+	if err != nil {
+		log.Printf("[bridge] WAL recovery: list pending: %v", err)
+	} else {
+		for _, w := range pending {
+			if err := b.state.OrphanWAL(w.ID); err != nil {
+				log.Printf("[bridge] WAL recovery: orphan id=%d: %v", w.ID, err)
+			} else {
+				log.Printf("[bridge] WAL recovery: orphaned id=%d intent=%s parent=%s", w.ID, w.Intent, w.ParentHarnessID)
+			}
+		}
+	}
+
+	// Pre-register the bridge_session_id so subsequent rollout inserts have a
+	// parent row. current_harness_id starts empty; UpsertSession rotates it
+	// each time a new thread_id is minted.
+	if err := b.state.UpsertSession(b.bridgeID, ""); err != nil {
+		return fmt.Errorf("upsert session: %w", err)
+	}
 
 	// Register all notification → event translations.
 	b.trans.RegisterHandlers(b.app)
@@ -148,6 +185,69 @@ func (b *Bridge) initAuth(ctx context.Context) error {
 	return nil
 }
 
+// recordChain writes the (bridge_session_id, harness_session_id) pair into
+// state.db under WAL: open a pending row, run the harness call, commit on
+// success or orphan on failure. Returns the new harness_session_id from the
+// harness call. The mint closure must perform the actual codex JSON-RPC call
+// and return the new thread id (or an error).
+//
+// kind ∈ {"start", "resume", "fork"}; parentHarnessID is empty for "start".
+func (b *Bridge) recordChain(intent, parentHarnessID string, sequence int, mint func() (string, error)) (string, error) {
+	walID, err := b.state.InsertWAL(WALRow{
+		BridgeSessionID: b.bridgeID,
+		Intent:          intent,
+		ParentHarnessID: parentHarnessID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("wal insert: %w", err)
+	}
+
+	newID, mintErr := mint()
+	if mintErr != nil {
+		if oErr := b.state.OrphanWAL(walID); oErr != nil {
+			log.Printf("[bridge] orphan WAL after mint failure: %v", oErr)
+		}
+		return "", mintErr
+	}
+
+	// Best-effort rollout path discovery — codex writes its session_meta
+	// rollout on disk asynchronously, so we may miss the file on the first
+	// try. Empty path is fine; consumers can locate it later via thread_id.
+	rolloutPath := findRolloutForThread(newID)
+
+	if err := b.state.CommitWAL(walID, newID, rolloutPath); err != nil {
+		return "", fmt.Errorf("wal commit: %w", err)
+	}
+
+	if err := b.state.InsertRollout(RolloutRow{
+		HarnessSessionID: newID,
+		BridgeSessionID:  b.bridgeID,
+		RolloutPath:      rolloutPath,
+		Sequence:         sequence,
+		ParentHarnessID:  parentHarnessID,
+		Kind:             intent,
+	}); err != nil {
+		log.Printf("[bridge] insert rollout: %v", err)
+	}
+	if err := b.state.UpsertSession(b.bridgeID, newID); err != nil {
+		log.Printf("[bridge] update session current_harness_id: %v", err)
+	}
+	return newID, nil
+}
+
+// nextSequence returns the sequence number to use for the next rollout in
+// the chain for this bridge_session_id.
+func (b *Bridge) nextSequence() int {
+	if b.state == nil {
+		return 0
+	}
+	rs, err := b.state.ListRollouts(b.bridgeID)
+	if err != nil || len(rs) == 0 {
+		return 0
+	}
+	return rs[len(rs)-1].Sequence + 1
+}
+
 // HandleStart creates a new thread and starts the first turn.
 func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 	// Apply start-time overrides from params.
@@ -171,27 +271,42 @@ func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 		b.cfg.SandboxPolicy = "workspace-write"
 	}
 
-	// If forking from a parent session, use thread/fork.
+	// If forking from a parent session, use thread/fork. Wrap the mint in WAL
+	// so the (bridge_session_id, new_thread_id) row is durable before any
+	// turn runs against it.
+	seq := b.nextSequence()
 	if params.Fork != "" {
-		result, err := b.codex.ThreadFork(ctx, &ThreadForkParams{ThreadID: params.Fork})
+		newID, err := b.recordChain("fork", params.Fork, seq, func() (string, error) {
+			result, err := b.codex.ThreadFork(ctx, &ThreadForkParams{ThreadID: params.Fork})
+			if err != nil {
+				return "", fmt.Errorf("thread/fork: %w", err)
+			}
+			return result.GetThreadID(), nil
+		})
 		if err != nil {
-			return fmt.Errorf("thread/fork: %w", err)
+			return err
 		}
-		b.threadID = result.GetThreadID()
+		b.threadID = newID
 		b.trans.SetSessionID(b.threadID)
 		log.Printf("[bridge] forked thread %s from %s", b.threadID, params.Fork)
 	} else {
-		result, err := b.codex.ThreadStart(ctx, &ThreadStartParams{
-			Model:                 b.cfg.CodexModel,
-			ApprovalPolicy:        b.cfg.ApprovalMode,
-			Sandbox:               b.cfg.SandboxPolicy,
-			Cwd:                   b.cfg.CodexWorkdir,
-			DeveloperInstructions: params.SystemPrompt,
+		newID, err := b.recordChain("start", "", seq, func() (string, error) {
+			result, err := b.codex.ThreadStart(ctx, &ThreadStartParams{
+				Model:                 b.cfg.CodexModel,
+				ApprovalPolicy:        b.cfg.ApprovalMode,
+				Sandbox:               b.cfg.SandboxPolicy,
+				Cwd:                   b.cfg.CodexWorkdir,
+				DeveloperInstructions: params.SystemPrompt,
+			})
+			if err != nil {
+				return "", fmt.Errorf("thread/start: %w", err)
+			}
+			return result.GetThreadID(), nil
 		})
 		if err != nil {
-			return fmt.Errorf("thread/start: %w", err)
+			return err
 		}
-		b.threadID = result.GetThreadID()
+		b.threadID = newID
 		b.trans.SetSessionID(b.threadID)
 		log.Printf("[bridge] started thread %s", b.threadID)
 	}
@@ -220,14 +335,32 @@ func (b *Bridge) HandleResume(ctx context.Context) error {
 }
 
 // HandleResumeThread resumes an existing thread by ID using the ThreadResume API.
+// Codex mints a new thread_id on resume; we record (bridge_session_id, new
+// thread_id) under WAL so the chain survives bridge crashes — exactly the
+// stub-rollout case that motivated this design.
 func (b *Bridge) HandleResumeThread(ctx context.Context, threadID string) error {
-	result, err := b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: threadID})
-	if err != nil {
-		return fmt.Errorf("thread/resume: %w", err)
+	seq := b.nextSequence()
+	parent := threadID
+	// If state.db already has rollouts for this bridge_session_id, prefer the
+	// latest committed harness id as the parent — server-passed threadID may
+	// be stale (e.g. an older value bridge-server cached before our last
+	// resume). state.db is the bridge-local source of truth.
+	if rs, err := b.state.ListRollouts(b.bridgeID); err == nil && len(rs) > 0 {
+		parent = rs[len(rs)-1].HarnessSessionID
 	}
-	b.threadID = result.GetThreadID()
+	newID, err := b.recordChain("resume", parent, seq, func() (string, error) {
+		result, err := b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: parent})
+		if err != nil {
+			return "", fmt.Errorf("thread/resume: %w", err)
+		}
+		return result.GetThreadID(), nil
+	})
+	if err != nil {
+		return err
+	}
+	b.threadID = newID
 	b.trans.SetSessionID(b.threadID)
-	log.Printf("[bridge] resumed thread %s", b.threadID)
+	log.Printf("[bridge] resumed thread %s (parent %s)", b.threadID, parent)
 	return b.startTurn(ctx, "Continue where you left off.")
 }
 
@@ -353,13 +486,22 @@ func (b *Bridge) Shutdown() {
 		defer cancel()
 		_ = b.codex.TurnInterrupt(ctx, &TurnInterruptParams{ThreadID: b.threadID})
 	}
-	b.app.Shutdown()
+	if b.app != nil {
+		b.app.Shutdown()
+	}
+	if b.state != nil {
+		b.state.Close()
+	}
 }
 
 // StartParams matches the harness protocol start request.
 type StartParams struct {
-	SessionID      string `json:"session_id"`
-	ClientID       string `json:"client_id,omitempty"`
+	// BridgeSessionID is the bridge-server stable id (preferred). SessionID
+	// is the legacy field the older bridge-server still populates; we read
+	// from BridgeSessionID first and fall back if it's empty.
+	BridgeSessionID string `json:"bridge_session_id,omitempty"`
+	SessionID       string `json:"session_id"`
+	ClientID        string `json:"client_id,omitempty"`
 	DisplayName    string `json:"display_name,omitempty"`
 	AgentID        string `json:"agent_id,omitempty"`
 	Prompt         string `json:"prompt,omitempty"`
