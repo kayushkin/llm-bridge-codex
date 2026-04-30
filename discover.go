@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,101 +13,188 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
-// discoverSessions scans Codex's on-disk session storage and returns all found sessions.
-// Sessions are stored at ~/.codex/sessions/<year>/<month>/<day>/rollout-<timestamp>-<uuid>.jsonl
+// discoverSessions returns one msg.StoredSession per bridge_session_id known
+// to state.db.
 //
-// Rollouts that the bridge has already chained in state.db (i.e. they're a
-// resume/fork continuation of a known bridge_session_id, not the originating
-// rollout) are skipped — they belong to their parent ManagedSession on the
-// bridge-server side and should not appear as standalone entries. Cold
-// rollouts that aren't in state.db pass through unchanged so existing
-// pre-fix data still surfaces.
+// Per the session-identity contract (ARCHITECTURE.md "Session Identity &
+// Resumption"), state.db is the source of truth: every session the bridge
+// has minted shows up there with its full rollout chain. The on-disk
+// `~/.codex/sessions/` tree is only used in two ways:
+//
+//  1. Cold import — any rollout file whose harness_session_id is NOT yet in
+//     state.db.rollouts (legacy data, or sessions started outside the
+//     bridge) is imported as a synthetic single-rollout session with
+//     bridge_session_id = harness_session_id, sequence=0, kind='start'.
+//     Lazy + idempotent: a second discover call sees the rows already
+//     present and skips them.
+//  2. Metadata extraction — for each emitted session we read the LATEST
+//     rollout's on-disk file to populate prompt / turns / cwd / timestamps.
+//
+// StoredSession.ID is always the bridge_session_id, never the
+// harness_session_id. Frontend uses this to start sessions; bridge-server
+// looks up the chain in state.db on resume.
 func discoverSessions() ([]msg.StoredSession, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-
 	sessionsDir := filepath.Join(home, ".codex", "sessions")
 
-	// Build the set of harness_session_ids that state.db has chained as
-	// non-originating rollouts (sequence > 0). These are stub continuations
-	// and should be hidden from the discover output. If state.db can't be
-	// opened for any reason we proceed without filtering — fail-safe toward
-	// surfacing rollouts rather than losing them.
-	chained := map[string]string{} // thread_id → bridge_session_id (sequence > 0 only)
-	if st, err := OpenState(DefaultStatePath()); err == nil {
-		defer st.Close()
-		if all, err := st.AllSessions(); err == nil {
-			for _, s := range all {
-				if rs, err := st.ListRollouts(s.BridgeSessionID); err == nil {
-					for _, r := range rs {
-						if r.Sequence > 0 {
-							chained[r.HarnessSessionID] = s.BridgeSessionID
-						}
-					}
-				}
-			}
-		}
+	st, err := OpenState(DefaultStatePath())
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+
+	if err := coldImportRollouts(st, sessionsDir); err != nil {
+		return nil, err
 	}
 
-	var sessions []msg.StoredSession
+	all, err := st.AllSessions()
+	if err != nil {
+		return nil, err
+	}
 
-	err = filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+	out := make([]msg.StoredSession, 0, len(all))
+	for _, sess := range all {
+		rollouts, err := st.ListRollouts(sess.BridgeSessionID)
 		if err != nil {
-			return nil
+			return nil, err
+		}
+		out = append(out, buildStoredSession(sess, rollouts))
+	}
+	return out, nil
+}
+
+// coldImportRollouts walks sessionsDir and inserts a synthetic session +
+// rollout row for every rollout file whose harness_session_id is not already
+// in state.db.rollouts. Idempotent: re-running on the same tree produces no
+// new rows.
+//
+// A missing or unreadable sessionsDir is not an error — it just means there
+// is nothing to cold-import (fresh install, or no codex CLI history yet).
+func coldImportRollouts(st *State, sessionsDir string) error {
+	known, err := loadKnownHarnessIDs(st)
+	if err != nil {
+		return err
+	}
+
+	walkErr := filepath.WalkDir(sessionsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Permission errors on subdirs shouldn't kill the whole import;
+			// keep walking.
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
 		}
 		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
 
-		info, err := d.Info()
-		if err != nil {
+		id, _, ts, _, _ := parseCodexSession(path)
+		if id == "" {
+			id = extractIDFromFilename(d.Name())
+		}
+		if id == "" {
+			return nil
+		}
+		if _, ok := known[id]; ok {
 			return nil
 		}
 
-		sess := msg.StoredSession{
-			Harness:   msg.HarnessCodex,
-			UpdatedAt: info.ModTime(),
-			Path:      path,
+		info, _ := d.Info()
+		created := ts
+		if created.IsZero() && info != nil {
+			created = info.ModTime()
 		}
 
-		// Extract session ID and metadata from file.
-		id, prompt, ts, cwd, turns := parseCodexSession(path)
-		sess.ID = id
-		sess.Prompt = prompt
-		sess.TurnCount = turns
-		if cwd != "" {
-			sess.Project = cwd
+		// Synthetic chain: bridge_session_id = harness_session_id, single
+		// rollout at sequence 0 with kind 'start' and no parent. When the
+		// user later resumes via the bridge, recordChain will append a real
+		// resume row at sequence 1 and the chain extends naturally.
+		if err := st.UpsertSession(id, id); err != nil {
+			return err
 		}
-		if !ts.IsZero() {
-			sess.CreatedAt = ts
-		} else {
-			sess.CreatedAt = info.ModTime()
+		if err := st.InsertRollout(RolloutRow{
+			HarnessSessionID: id,
+			BridgeSessionID:  id,
+			RolloutPath:      path,
+			Sequence:         0,
+			Kind:             "start",
+			CreatedAt:        created,
+		}); err != nil {
+			return err
 		}
-
-		// Fall back: extract ID from filename if not in content.
-		// Format: rollout-<timestamp>-<uuid>.jsonl
-		if sess.ID == "" {
-			sess.ID = extractIDFromFilename(d.Name())
-		}
-
-		// Skip rollouts that state.db knows are non-originating continuations
-		// (resume/fork sequence > 0). They belong to their parent
-		// bridge_session_id and shouldn't appear as standalone discovered
-		// sessions — that's how the stub-rollout problem stops surfacing.
-		if _, isChain := chained[sess.ID]; isChain {
-			return nil
-		}
-
-		sessions = append(sessions, sess)
+		known[id] = struct{}{}
 		return nil
 	})
+	if walkErr != nil && !errors.Is(walkErr, fs.ErrNotExist) {
+		return walkErr
+	}
+	return nil
+}
+
+// loadKnownHarnessIDs returns the set of harness_session_ids already
+// present in state.db.rollouts across all sessions.
+func loadKnownHarnessIDs(st *State) (map[string]struct{}, error) {
+	known := map[string]struct{}{}
+	all, err := st.AllSessions()
 	if err != nil {
 		return nil, err
 	}
+	for _, sess := range all {
+		rs, err := st.ListRollouts(sess.BridgeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rs {
+			known[r.HarnessSessionID] = struct{}{}
+		}
+	}
+	return known, nil
+}
 
-	return sessions, nil
+// buildStoredSession projects a (session, rollouts) pair into a
+// msg.StoredSession. Metadata (prompt, turns, project cwd, created_at)
+// comes from the LATEST rollout's on-disk file when available; if the file
+// is missing or rollouts are empty the StoredSession still ships with
+// whatever the state.db rows themselves carry.
+func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSession {
+	out := msg.StoredSession{
+		ID:        sess.BridgeSessionID,
+		Harness:   msg.HarnessCodex,
+		CreatedAt: sess.CreatedAt,
+		UpdatedAt: sess.UpdatedAt,
+	}
+
+	if len(rollouts) == 0 {
+		return out
+	}
+
+	// rollouts is ordered by sequence ASC (per ListRollouts), so the latest
+	// is the last element.
+	latest := rollouts[len(rollouts)-1]
+	if latest.RolloutPath != "" {
+		out.Path = latest.RolloutPath
+		if info, err := os.Stat(latest.RolloutPath); err == nil {
+			out.UpdatedAt = info.ModTime()
+		}
+		_, prompt, ts, cwd, turns := parseCodexSession(latest.RolloutPath)
+		out.Prompt = prompt
+		out.TurnCount = turns
+		if cwd != "" {
+			out.Project = cwd
+		}
+		// Prefer the rollout file's session_meta timestamp for created_at —
+		// it's the harness's own start time, more meaningful than the
+		// state.db row insertion time.
+		if !ts.IsZero() {
+			out.CreatedAt = ts
+		}
+	}
+
+	return out
 }
 
 // parseCodexSession reads the session_meta line and scans for user input to extract metadata.
@@ -129,7 +218,7 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 		}
 
 		var entry struct {
-			Type    string `json:"type"`
+			Type    string          `json:"type"`
 			Payload json.RawMessage `json:"payload"`
 		}
 		if json.Unmarshal(line, &entry) != nil {
@@ -180,11 +269,6 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 			if json.Unmarshal(entry.Payload, &item) == nil && item.Role == "user" {
 				turns++
 			}
-		}
-
-		// Stop scanning after we have everything we need and a reasonable sample.
-		if metaDone && promptDone && turns > 0 {
-			// Continue counting turns but skip heavy parsing.
 		}
 	}
 
