@@ -75,21 +75,8 @@ func (b *Bridge) Init(ctx context.Context, sessionID, clientID string, emit func
 	}
 	b.state = st
 
-	// Reconcile any WAL rows left pending by a previous crash. Mark them
-	// orphaned so they don't block future operations. Operator can recover
-	// the orphan rollout files manually if needed (see ARCHITECTURE.md
-	// "Resume flow" — crash window).
-	pending, err := b.state.ListPendingWAL()
-	if err != nil {
-		log.Printf("[bridge] WAL recovery: list pending: %v", err)
-	} else {
-		for _, w := range pending {
-			if err := b.state.OrphanWAL(w.ID); err != nil {
-				log.Printf("[bridge] WAL recovery: orphan id=%d: %v", w.ID, err)
-			} else {
-				log.Printf("[bridge] WAL recovery: orphaned id=%d intent=%s parent=%s", w.ID, w.Intent, w.ParentHarnessID)
-			}
-		}
+	if err := recoverOrphansOnBoot(b.state); err != nil {
+		log.Printf("[bridge] WAL recovery: %v", err)
 	}
 
 	// Pre-register the bridge_session_id so subsequent rollout inserts have a
@@ -182,6 +169,24 @@ func (b *Bridge) initAuth(ctx context.Context) error {
 		log.Printf("[bridge] authenticated: plan=%s auth=%s email=%s", acct.Plan, acct.AuthMode, acct.Email)
 	}
 
+	return nil
+}
+
+// recoverOrphansOnBoot marks any pending WAL rows from a prior crash as
+// orphaned so they don't shadow future operations. Idempotent: a second
+// call after recovery is a no-op.
+func recoverOrphansOnBoot(s *State) error {
+	pending, err := s.ListPendingWAL()
+	if err != nil {
+		return fmt.Errorf("list pending: %w", err)
+	}
+	for _, w := range pending {
+		if err := s.OrphanWAL(w.ID); err != nil {
+			log.Printf("[bridge] WAL recovery: orphan id=%d: %v", w.ID, err)
+			continue
+		}
+		log.Printf("[bridge] WAL recovery: orphaned id=%d intent=%s parent=%s", w.ID, w.Intent, w.ParentHarnessID)
+	}
 	return nil
 }
 
