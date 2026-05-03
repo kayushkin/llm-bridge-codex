@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kayushkin/llm-bridge/msg"
 )
 
 // TestDiscoverColdImportAndIdempotent covers the cold-rollout discover
@@ -26,8 +28,11 @@ import (
 //   - emit 7 again (no duplicates, no drift)
 //   - not insert any new rollout rows
 //
-// StoredSession.ID must always be bridge_session_id, never the rotating
-// harness_session_id of any chain row past sequence 0.
+// Each StoredSession surfaces both BridgeSessionID (chain head) and
+// HarnessSessionID (current_harness_id). For pre-seeded bridge-spawned
+// chains the two differ; for cold-imports the synthetic chain sets them
+// equal. Bridge-server dedupes on HarnessSessionID, so the rotating chain
+// rows past sequence 0 must NOT leak through as either field.
 func TestDiscoverColdImportAndIdempotent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -77,6 +82,15 @@ func TestDiscoverColdImportAndIdempotent(t *testing.T) {
 			t.Fatalf("InsertRollout %s: %v", r.hsid, err)
 		}
 	}
+	// Mirror production: handler rotates current_harness_id to the latest
+	// chain head after each successful turn (see handler.go:237). Without
+	// this, discover would emit HarnessSessionID="" for the seeded chains.
+	if err := seedSt.UpsertSession("bsid-A", "hsid-A2"); err != nil {
+		t.Fatalf("rotate bsid-A current_harness_id: %v", err)
+	}
+	if err := seedSt.UpsertSession("bsid-B", "hsid-B2"); err != nil {
+		t.Fatalf("rotate bsid-B current_harness_id: %v", err)
+	}
 	if err := seedSt.Close(); err != nil {
 		t.Fatalf("seedSt close: %v", err)
 	}
@@ -113,25 +127,51 @@ func TestDiscoverColdImportAndIdempotent(t *testing.T) {
 		t.Fatalf("after 2nd call: sessions/rollouts = %v, want [7 11] (idempotency broken)", got)
 	}
 
-	// IDs must be bridge_session_ids — pre-seeded chain harness_ids must
-	// never leak through as StoredSession.ID.
-	got := map[string]bool{}
+	// Index emitted sessions by BridgeSessionID and assert per-row contract.
+	byBridge := map[string]msg.StoredSession{}
 	for _, s := range sessions {
-		got[s.ID] = true
+		if s.BridgeSessionID == "" {
+			t.Errorf("StoredSession with empty BridgeSessionID: %+v", s)
+			continue
+		}
+		byBridge[s.BridgeSessionID] = s
 	}
-	for _, b := range []string{"bsid-A", "bsid-B"} {
-		if !got[b] {
-			t.Errorf("missing pre-seeded bridge_session_id %q in discover output", b)
+
+	// Pre-seeded chains: BridgeSessionID is the chain head; HarnessSessionID
+	// is the latest rotated chain row (current_harness_id).
+	wantPreseed := map[string]string{"bsid-A": "hsid-A2", "bsid-B": "hsid-B2"}
+	for bsid, wantHsid := range wantPreseed {
+		s, ok := byBridge[bsid]
+		if !ok {
+			t.Errorf("missing pre-seeded BridgeSessionID %q in discover output", bsid)
+			continue
+		}
+		if s.HarnessSessionID != wantHsid {
+			t.Errorf("pre-seeded %s: HarnessSessionID = %q, want %q", bsid, s.HarnessSessionID, wantHsid)
 		}
 	}
+
+	// Cold-imported chains: synthetic chain sets BridgeSessionID == HarnessSessionID.
 	for _, hid := range coldIDs {
-		if !got[hid] {
-			t.Errorf("missing cold-imported synthetic id %q in discover output", hid)
+		s, ok := byBridge[hid]
+		if !ok {
+			t.Errorf("missing cold-imported BridgeSessionID %q in discover output", hid)
+			continue
+		}
+		if s.HarnessSessionID != hid {
+			t.Errorf("cold-imported %s: HarnessSessionID = %q, want %q", hid, s.HarnessSessionID, hid)
 		}
 	}
-	for _, hid := range []string{"hsid-A0", "hsid-A1", "hsid-A2", "hsid-B0", "hsid-B1", "hsid-B2"} {
-		if got[hid] {
-			t.Errorf("chain harness_session_id %q leaked as StoredSession.ID — expected only bridge_session_id", hid)
+
+	// Intermediate chain rows must NOT surface as either id field.
+	for _, hid := range []string{"hsid-A0", "hsid-A1", "hsid-B0", "hsid-B1"} {
+		if _, leaked := byBridge[hid]; leaked {
+			t.Errorf("intermediate chain harness id %q leaked as a BridgeSessionID", hid)
+		}
+		for _, s := range sessions {
+			if s.HarnessSessionID == hid {
+				t.Errorf("intermediate chain harness id %q leaked as a HarnessSessionID", hid)
+			}
 		}
 	}
 }
