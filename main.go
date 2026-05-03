@@ -66,6 +66,15 @@ func main() {
 		os.Exit(0)
 	}
 
+	// -import-history is part of the conformance contract but not yet
+	// implemented for codex. Exit 2 to signal "unsupported" rather than
+	// silently falling through to the JSON-RPC loop, which would otherwise
+	// show up as a false-positive PASS on the conformance dashboard.
+	if len(os.Args) > 1 && os.Args[1] == "-import-history" {
+		fmt.Fprintln(os.Stderr, "llm-bridge-codex: -import-history not yet implemented")
+		os.Exit(2)
+	}
+
 	// All log output goes to stderr — stdout is reserved for NDJSON events.
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
