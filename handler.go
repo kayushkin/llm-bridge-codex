@@ -253,9 +253,12 @@ func (b *Bridge) nextSequence() int {
 	return rs[len(rs)-1].Sequence + 1
 }
 
-// HandleStart creates a new thread and starts the first turn.
-func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
-	// Apply start-time overrides from params.
+// applyStartConfig folds StartParams overrides into b.cfg. Precedence (last
+// write wins): explicit fields → auto_approve → bypass_permissions. Bypass is
+// last because it's the strongest user signal — "I've explicitly opted out
+// of every permission gate"; nothing on the per-session level should be able
+// to put gates back.
+func (b *Bridge) applyStartConfig(params StartParams) {
 	if params.Model != "" {
 		b.cfg.CodexModel = params.Model
 	}
@@ -275,6 +278,15 @@ func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 		b.cfg.ApprovalMode = "never"
 		b.cfg.SandboxPolicy = "workspace-write"
 	}
+	if params.BypassPermissions {
+		b.cfg.ApprovalMode = "never"
+		b.cfg.SandboxPolicy = "danger-full-access"
+	}
+}
+
+// HandleStart creates a new thread and starts the first turn.
+func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
+	b.applyStartConfig(params)
 
 	// If forking from a parent session, use thread/fork. Wrap the mint in WAL
 	// so the (bridge_session_id, new_thread_id) row is durable before any
@@ -519,6 +531,16 @@ type StartParams struct {
 	SystemPrompt   string `json:"system_prompt,omitempty"`
 	Effort         string `json:"effort,omitempty"`
 	AutoApprove    *bool  `json:"auto_approve,omitempty"`
+
+	// BypassPermissions is the canonical "this session is bypassed" signal
+	// forwarded by bridge-server when the user has the global Bypass
+	// Permissions toggle on. Codex's harness-level interpretation: skip the
+	// approval prompt path (approval=never) AND drop the bwrap sandbox
+	// (sandbox=danger-full-access). The latter is what makes bypass useful
+	// on Ubuntu 24.04 hosts where workspace-write fails at the bwrap
+	// loopback step (RTM_NEWADDR EPERM). Wins over both per-session
+	// permission_mode/sandbox and auto_approve.
+	BypassPermissions bool `json:"bypass_permissions,omitempty"`
 }
 
 // MessageParams matches the harness protocol message request.
