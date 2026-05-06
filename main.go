@@ -97,7 +97,9 @@ func main() {
 
 	bridge := NewBridge(cfg, emit)
 
-	// Handle SIGINT: interrupt current turn, emit idle state.
+	// Handle SIGINT: interrupt current turn. Resulting state is
+	// derived centrally — bridge-server tracks pause/abort calls
+	// and flips SessionState accordingly.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -107,9 +109,6 @@ func main() {
 				if err := bridge.HandleInterrupt(ctx); err != nil {
 					log.Printf("interrupt: %v", err)
 				}
-				e := bridge.event(msg.EventSessionState)
-				e.State = &msg.StateEvent{State: msg.SessionIdle}
-				emit(e)
 				continue
 			}
 			// SIGTERM: clean shutdown.
@@ -257,13 +256,5 @@ func emitError(emit func(msg.Event), sessionID, clientID, code, message string) 
 		Timestamp:        now,
 		Error:            &msg.ErrorEvent{Code: code, Message: message},
 	})
-	emit(msg.Event{
-		Type:             msg.EventSessionState,
-		Harness:          msg.HarnessCodex,
-		BridgeSessionID:  sessionID,
-		HarnessSessionID: sessionID,
-		ClientID:         clientID,
-		Timestamp:        now,
-		State:            &msg.StateEvent{State: msg.SessionError},
-	})
+	// SessionError is derived centrally by llm-bridge-server from EventError.
 }

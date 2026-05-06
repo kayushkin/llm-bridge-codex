@@ -114,10 +114,8 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(n.Thread, &threadInfo); err == nil && threadInfo.ModelProvider != "" {
 			t.model = threadInfo.ModelProvider
 		}
-		e := t.event(msg.EventSessionState)
-		e.State = &msg.StateEvent{State: msg.SessionRunning}
-		e.Raw = params
-		t.emit(e)
+		// SessionState is derived centrally by llm-bridge-server; no
+		// EventSessionState emission here.
 	})
 
 	srv.OnNotification("thread/status/changed", func(_ string, params json.RawMessage) {
@@ -137,10 +135,9 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventSessionState)
-		e.State = &msg.StateEvent{State: msg.SessionRunning}
-		e.Raw = params
-		t.emit(e)
+		_ = n
+		// Turn-start state is derived centrally by llm-bridge-server
+		// from EventUserMessage; no EventSessionState emission here.
 	})
 
 	// Token usage is reported separately before turn/completed.
@@ -187,11 +184,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		e.Raw = params
 		t.emit(e)
 
-		// Emit completed state.
-		se := t.event(msg.EventSessionState)
-		se.State = &msg.StateEvent{State: msg.SessionCompleted}
-		t.emit(se)
-
+		// Turn-end state derived centrally from EventResult.
 		t.resetTurn(n.ThreadID)
 	})
 
@@ -209,10 +202,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		e.Raw = params
 		t.emit(e)
 
-		se := t.event(msg.EventSessionState)
-		se.State = &msg.StateEvent{State: msg.SessionError}
-		t.emit(se)
-
+		// SessionError derived centrally from EventError.
 		t.resetTurn(n.ThreadID)
 	})
 
