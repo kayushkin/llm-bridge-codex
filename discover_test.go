@@ -193,6 +193,38 @@ func TestDiscoverNoSessionsDir(t *testing.T) {
 	}
 }
 
+// TestBuildStoredSession_ConformanceSourceTag covers the structural source
+// tagging that lets bridge-server file conformance-leaked sessions under
+// the Conformance folder without depending on a populated rollout file.
+// The conformance suite pins bridge_session_id to "conformance-<feature>"
+// (see llm-bridge-server/conformance/runner.go), so the prefix is the
+// authoritative signal — bridge-server's prompt-prefix heuristic was
+// missing every leak whose rollout_path was empty (the codex CLI flushes
+// session_meta asynchronously, so half of state.db.rollouts had no path).
+func TestBuildStoredSession_ConformanceSourceTag(t *testing.T) {
+	cases := []struct {
+		name            string
+		bridgeSessionID string
+		wantSource      string
+	}{
+		{"conformance leak", "conformance-error", "conformance"},
+		{"conformance other feature", "conformance-context", "conformance"},
+		{"bridge-spawned chain", "bsid-A", ""},
+		{"cold-import (synthetic)", "019d7f71-0e3e-7bb3-9cb3-b7e620e5810e", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildStoredSession(SessionRow{
+				BridgeSessionID:  tc.bridgeSessionID,
+				CurrentHarnessID: "hsid-X",
+			}, nil)
+			if got.Source != tc.wantSource {
+				t.Errorf("Source = %q, want %q", got.Source, tc.wantSource)
+			}
+		})
+	}
+}
+
 // writeRolloutFile drops a minimal-but-valid Codex rollout JSONL file in
 // dir, named after harnessID. Includes a session_meta line plus one
 // user response_item so parseCodexSession can extract id/cwd/turns/prompt.

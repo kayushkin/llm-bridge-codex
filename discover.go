@@ -169,6 +169,7 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 		Harness:          msg.HarnessCodex,
 		CreatedAt:        sess.CreatedAt,
 		UpdatedAt:        sess.UpdatedAt,
+		Source:           sourceFromBridgeSessionID(sess.BridgeSessionID),
 	}
 
 	if len(rollouts) == 0 {
@@ -198,6 +199,21 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 	}
 
 	return out
+}
+
+// sourceFromBridgeSessionID classifies a session by its bridge_session_id.
+// The conformance suite spawns the harness with stable session_ids of the
+// form "conformance-<feature>" (see llm-bridge-server/conformance/runner.go),
+// so any chain whose bridge_session_id carries that prefix is a leaked test
+// session. Returning the structural tag here lets bridge-server file these
+// rows under the Conformance folder without having to extract a prompt from
+// the on-disk rollout — which is empty when codex hasn't flushed session_meta
+// yet, the source of the original "blank codex sessions" leak.
+func sourceFromBridgeSessionID(bridgeSessionID string) string {
+	if strings.HasPrefix(bridgeSessionID, "conformance-") {
+		return "conformance"
+	}
+	return ""
 }
 
 // parseCodexSession reads the session_meta line and scans for user input to extract metadata.
