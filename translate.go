@@ -54,7 +54,7 @@ func (t *Translator) event(typ msg.EventType) msg.Event {
 		Harness:          msg.HarnessCodex,
 		BridgeSessionID:  t.bridgeID,
 		HarnessSessionID: t.sessionID,
-		ClientID:         t.clientID,
+		ClientRequestID:  t.clientID,
 		Timestamp:        time.Now(),
 	}
 }

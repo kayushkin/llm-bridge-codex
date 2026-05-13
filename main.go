@@ -252,7 +252,7 @@ func emitError(emit func(msg.Event), sessionID, clientID, code, message string) 
 		Harness:          msg.HarnessCodex,
 		BridgeSessionID:  sessionID,
 		HarnessSessionID: sessionID,
-		ClientID:         clientID,
+		ClientRequestID:  clientID,
 		Timestamp:        now,
 		Error:            &msg.ErrorEvent{Code: code, Message: message},
 	})

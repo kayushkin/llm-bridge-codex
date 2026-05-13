@@ -55,7 +55,7 @@ func (b *Bridge) event(typ msg.EventType) msg.Event {
 		Harness:          msg.HarnessCodex,
 		BridgeSessionID:  b.bridgeID,
 		HarnessSessionID: b.threadID,
-		ClientID:         b.clientID,
+		ClientRequestID:  b.clientID,
 		Timestamp:        time.Now(),
 	}
 }
@@ -254,10 +254,10 @@ func (b *Bridge) nextSequence() int {
 }
 
 // applyStartConfig folds StartParams overrides into b.cfg. Precedence (last
-// write wins): explicit fields → auto_approve → bypass_permissions. Bypass is
-// last because it's the strongest user signal — "I've explicitly opted out
-// of every permission gate"; nothing on the per-session level should be able
-// to put gates back.
+// write wins): explicit fields → auto_approve → bypass_permissions → canonical
+// permission_mode. The canonical mode is last because it's the new
+// single-source signal from bridge-server; nothing on the per-session level
+// should be able to override the user's mode choice silently.
 func (b *Bridge) applyStartConfig(params StartParams) {
 	if params.Model != "" {
 		b.cfg.CodexModel = params.Model
@@ -265,7 +265,11 @@ func (b *Bridge) applyStartConfig(params StartParams) {
 	if params.WorkDir != "" {
 		b.cfg.CodexWorkdir = params.WorkDir
 	}
-	if params.ApprovalMode != "" {
+	// ApprovalMode accepts either codex-vocab strings (on-request, never,
+	// granular, untrusted) or — for back-compat with direct callers — passes
+	// through unchanged. Canonical bridge values (ask/auto/bypass) are
+	// translated below via params.ApprovalMode → applyCanonicalPermissionMode.
+	if params.ApprovalMode != "" && !isCanonicalPermissionMode(params.ApprovalMode) {
 		b.cfg.ApprovalMode = params.ApprovalMode
 	}
 	if params.Sandbox != "" {
@@ -279,6 +283,40 @@ func (b *Bridge) applyStartConfig(params StartParams) {
 		b.cfg.SandboxPolicy = "workspace-write"
 	}
 	if params.BypassPermissions {
+		b.cfg.ApprovalMode = "never"
+		b.cfg.SandboxPolicy = "danger-full-access"
+	}
+	// Canonical bridge mode (ask/auto/bypass) — arrives via the same
+	// permission_mode wire field. Translates to codex's native vocabulary.
+	if isCanonicalPermissionMode(params.ApprovalMode) {
+		b.applyCanonicalPermissionMode(params.ApprovalMode)
+	}
+}
+
+// isCanonicalPermissionMode reports whether m is one of the bridge-canonical
+// values (ask/auto/bypass) rather than a codex-vocab string.
+func isCanonicalPermissionMode(m string) bool {
+	switch m {
+	case msg.PermissionModeAsk, msg.PermissionModeAuto, msg.PermissionModeBypass:
+		return true
+	}
+	return false
+}
+
+// applyCanonicalPermissionMode maps the bridge-canonical mode to codex's
+// ApprovalMode + SandboxPolicy combo. Auto is interpreted as "approve
+// edits inside the workspace, ask for shell escape" which matches the
+// prehook-side auto-mode safe-tool set as closely as codex's two-axis
+// model allows.
+func (b *Bridge) applyCanonicalPermissionMode(mode string) {
+	switch mode {
+	case msg.PermissionModeAsk:
+		// Codex defaults — leave ApprovalMode/SandboxPolicy alone so the env
+		// or per-call override decides.
+	case msg.PermissionModeAuto:
+		b.cfg.ApprovalMode = "on-request"
+		b.cfg.SandboxPolicy = "workspace-write"
+	case msg.PermissionModeBypass:
 		b.cfg.ApprovalMode = "never"
 		b.cfg.SandboxPolicy = "danger-full-access"
 	}
