@@ -156,13 +156,66 @@ func (b *Bridge) ensureAppServer(ctx context.Context) error {
 // spawn time (not per-turn) into `-c key=value` CLI arguments. Anything
 // per-turn (model, approval, sandbox) is set via TurnStart params, not
 // here. Only flags that codex's protocol exposes ONLY at the config
-// layer (e.g. sandbox_workspace_write.network_access) belong here.
+// layer (e.g. sandbox_workspace_write.network_access, hooks) belong here.
 func (b *Bridge) buildAppServerExtraArgs() []string {
 	var args []string
 	if b.cfg.DisableNetwork {
 		args = append(args, "-c", "sandbox_workspace_write.network_access=false")
 	}
+	if hookArgs := b.codexHookArgs(); len(hookArgs) > 0 {
+		args = append(args, hookArgs...)
+	}
 	return args
+}
+
+// codexHookArgs translates b.cfg.CodexHooks (a JSON tree shaped like CC
+// settings.json's .hooks block) into `-c hooks.<EventName>=<inline-toml>`
+// arguments. One -c arg per top-level event key so codex doesn't have
+// to parse a single mega-blob.
+//
+// Returns an empty slice when CodexHooks is empty / unparseable; the
+// error is logged but not propagated since hook injection is best-effort
+// (a misformed config shouldn't kill the session).
+func (b *Bridge) codexHookArgs() []string {
+	if len(b.cfg.CodexHooks) == 0 {
+		return nil
+	}
+	var tree map[string]json.RawMessage
+	if err := json.Unmarshal(b.cfg.CodexHooks, &tree); err != nil {
+		log.Printf("[bridge] codex_hooks unparseable: %v", err)
+		return nil
+	}
+	keys := make([]string, 0, len(tree))
+	for k := range tree {
+		keys = append(keys, k)
+	}
+	// Deterministic order for log and test reproducibility.
+	sortStringsForOrder(keys)
+	args := make([]string, 0, 2*len(keys))
+	for _, event := range keys {
+		var value any
+		if err := json.Unmarshal(tree[event], &value); err != nil {
+			log.Printf("[bridge] codex_hooks.%s unparseable: %v", event, err)
+			continue
+		}
+		inline, err := jsonValueToInlineTOML(value)
+		if err != nil {
+			log.Printf("[bridge] codex_hooks.%s: TOML render: %v", event, err)
+			continue
+		}
+		args = append(args, "-c", fmt.Sprintf("hooks.%s=%s", event, inline))
+	}
+	return args
+}
+
+func sortStringsForOrder(s []string) {
+	// stdlib sort.Strings without importing sort here — keep this file's
+	// import set tight. tiny insertion sort is fine for ≤10 hook events.
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
 }
 
 func (b *Bridge) initAuth(ctx context.Context) error {
@@ -322,6 +375,10 @@ func (b *Bridge) applyStartConfig(params StartParams) {
 	// DisableNetwork is a sandbox-layer flag, independent of approval
 	// policy. Applied at app-server spawn time via buildAppServerExtraArgs.
 	b.cfg.DisableNetwork = params.DisableNetwork
+	// CodexHooks: the synthesized hooks tree from bridge-server. Stored
+	// as raw JSON; translated to `-c hooks.<EventName>=<inline-toml>`
+	// arguments in buildAppServerExtraArgs.
+	b.cfg.CodexHooks = params.CodexHooks
 	// Canonical bridge mode (ask/auto/bypass) — arrives via the same
 	// permission_mode wire field. Translates to codex's native vocabulary.
 	if isCanonicalPermissionMode(params.ApprovalMode) {
@@ -695,6 +752,21 @@ type StartParams struct {
 	// ApprovalMode == "custom". When set, these values override codex's
 	// env-loaded defaults on the next turn.
 	PermissionModeCustom *PermissionModeCustomConfig `json:"permission_mode_custom,omitempty"`
+
+	// CodexHooks is the synthesized hooks tree bridge-server writes into
+	// HarnessConfig.codex_hooks (see hook_settings.go:buildCodexHookConfig).
+	// Shape:
+	//
+	//   { "PreToolUse": [
+	//       { "matcher": ".*",
+	//         "hooks": [{"type":"command","command":"curl …","timeout":86400}] }
+	//   ] }
+	//
+	// At app-server spawn time the bridge translates each top-level event
+	// key to a `-c hooks.<EventName>=<inline-toml>` argument so codex
+	// loads the hooks via its TOML override path (codex has no hooks-file
+	// flag). Empty / absent → no overrides.
+	CodexHooks json.RawMessage `json:"codex_hooks,omitempty"`
 }
 
 // PermissionModeCustomConfig holds the raw codex-vocab knobs surfaced

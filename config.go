@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"strconv"
@@ -20,6 +21,12 @@ type Config struct {
 	// harness adds `-c sandbox_workspace_write.network_access=false` to
 	// the app-server spawn. Orthogonal to ApprovalMode/SandboxPolicy.
 	DisableNetwork bool
+
+	// CodexHooks is the per-session hooks tree forwarded by bridge-server
+	// (HarnessConfig.codex_hooks). Stored as raw JSON; translated to
+	// `-c hooks.<EventName>=<inline-toml>` args at app-server spawn time.
+	// Empty / nil → no overrides.
+	CodexHooks json.RawMessage
 }
 
 func loadConfig() Config {
