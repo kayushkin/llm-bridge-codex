@@ -15,6 +15,11 @@ type Config struct {
 	ApprovalMode  string // "on-request", "never", "granular", "untrusted"
 	SandboxPolicy string // "read-only", "workspace-write", "danger-full-access"
 	Effort        string // Effort level for turns
+
+	// DisableNetwork toggles codex's sandbox network gate. When true, the
+	// harness adds `-c sandbox_workspace_write.network_access=false` to
+	// the app-server spawn. Orthogonal to ApprovalMode/SandboxPolicy.
+	DisableNetwork bool
 }
 
 func loadConfig() Config {

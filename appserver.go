@@ -24,6 +24,13 @@ type AppServer struct {
 	port      int
 	workdir   string
 
+	// extraArgs is appended to the `codex app-server` command line at
+	// Start. Used for per-session `-c key=value` config overrides
+	// (e.g. sandbox_workspace_write.network_access=false). Set via
+	// SetExtraArgs before Start; ignored on attach to an already-running
+	// instance.
+	extraArgs []string
+
 	notifHandlers map[string]NotificationHandler
 	reqHandlers   map[string]RequestHandler
 }
@@ -40,6 +47,16 @@ func NewAppServer(codexPath string, port int, workdir string) *AppServer {
 
 func (a *AppServer) OnNotification(method string, h NotificationHandler) {
 	a.notifHandlers[method] = h
+}
+
+// SetExtraArgs replaces the per-session extra args appended to
+// `codex app-server` at Start. Call before Start; subsequent calls
+// after Start has connected are no-ops at the process level (we don't
+// respawn). Pass nil to clear.
+func (a *AppServer) SetExtraArgs(args []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.extraArgs = args
 }
 
 func (a *AppServer) OnRequest(method string, h RequestHandler) {
@@ -69,7 +86,9 @@ func (a *AppServer) Start(ctx context.Context) error {
 
 	// Spawn the process.
 	listenAddr := fmt.Sprintf("ws://127.0.0.1:%d", a.port)
-	cmd := exec.Command(a.codexPath, "app-server", "--listen", listenAddr)
+	args := []string{"app-server", "--listen", listenAddr}
+	args = append(args, a.extraArgs...)
+	cmd := exec.Command(a.codexPath, args...)
 	cmd.Dir = a.workdir
 	cmd.Stdout = os.Stderr // Bridge stdout is reserved for NDJSON events
 	cmd.Stderr = os.Stderr

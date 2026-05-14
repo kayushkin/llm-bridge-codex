@@ -118,6 +118,26 @@ func (b *Bridge) Init(ctx context.Context, sessionID, clientID string, emit func
 		}
 	})
 
+	// Note: app.Start is deferred to ensureAppServer (called from
+	// HandleStart / HandleResumeThread) so per-session `-c key=value`
+	// config overrides like sandbox_workspace_write.network_access can be
+	// applied before the codex process spawns.
+
+	return nil
+}
+
+// ensureAppServer starts the codex app-server with any extra `-c` args
+// derived from b.cfg, then connects and authenticates. Idempotent — safe
+// to call from both HandleStart and HandleResumeThread. Must be called
+// AFTER applyStartConfig so b.cfg reflects the session's overrides.
+func (b *Bridge) ensureAppServer(ctx context.Context) error {
+	if b.codex != nil {
+		// Already started.
+		return nil
+	}
+
+	b.app.SetExtraArgs(b.buildAppServerExtraArgs())
+
 	if err := b.app.Start(ctx); err != nil {
 		return fmt.Errorf("start app-server: %w", err)
 	}
@@ -130,6 +150,19 @@ func (b *Bridge) Init(ctx context.Context, sessionID, clientID string, emit func
 	}
 
 	return nil
+}
+
+// buildAppServerExtraArgs translates b.cfg flags that ship at app-server
+// spawn time (not per-turn) into `-c key=value` CLI arguments. Anything
+// per-turn (model, approval, sandbox) is set via TurnStart params, not
+// here. Only flags that codex's protocol exposes ONLY at the config
+// layer (e.g. sandbox_workspace_write.network_access) belong here.
+func (b *Bridge) buildAppServerExtraArgs() []string {
+	var args []string
+	if b.cfg.DisableNetwork {
+		args = append(args, "-c", "sandbox_workspace_write.network_access=false")
+	}
+	return args
 }
 
 func (b *Bridge) initAuth(ctx context.Context) error {
@@ -286,10 +319,24 @@ func (b *Bridge) applyStartConfig(params StartParams) {
 		b.cfg.ApprovalMode = "never"
 		b.cfg.SandboxPolicy = "danger-full-access"
 	}
+	// DisableNetwork is a sandbox-layer flag, independent of approval
+	// policy. Applied at app-server spawn time via buildAppServerExtraArgs.
+	b.cfg.DisableNetwork = params.DisableNetwork
 	// Canonical bridge mode (ask/auto/bypass) — arrives via the same
 	// permission_mode wire field. Translates to codex's native vocabulary.
 	if isCanonicalPermissionMode(params.ApprovalMode) {
 		b.applyCanonicalPermissionMode(params.ApprovalMode)
+	}
+	// Custom mode's raw knobs override the canonical translation. Empty
+	// fields fall through so partial overrides work (e.g. set sandbox
+	// without touching approval).
+	if params.ApprovalMode == msg.PermissionModeCustom && params.PermissionModeCustom != nil {
+		if params.PermissionModeCustom.Approval != "" {
+			b.cfg.ApprovalMode = params.PermissionModeCustom.Approval
+		}
+		if params.PermissionModeCustom.Sandbox != "" {
+			b.cfg.SandboxPolicy = params.PermissionModeCustom.Sandbox
+		}
 	}
 }
 
@@ -362,6 +409,10 @@ func (b *Bridge) applyCanonicalPermissionMode(mode string) {
 func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 	b.applyStartConfig(params)
 
+	if err := b.ensureAppServer(ctx); err != nil {
+		return err
+	}
+
 	// If forking from a parent session, use thread/fork. Wrap the mint in WAL
 	// so the (bridge_session_id, new_thread_id) row is durable before any
 	// turn runs against it.
@@ -430,6 +481,9 @@ func (b *Bridge) HandleResume(ctx context.Context) error {
 // thread_id) under WAL so the chain survives bridge crashes — exactly the
 // stub-rollout case that motivated this design.
 func (b *Bridge) HandleResumeThread(ctx context.Context, threadID string) error {
+	if err := b.ensureAppServer(ctx); err != nil {
+		return err
+	}
 	seq := b.nextSequence()
 	parent := threadID
 	// If state.db already has rollouts for this bridge_session_id, prefer the
@@ -629,6 +683,28 @@ type StartParams struct {
 	// loopback step (RTM_NEWADDR EPERM). Wins over both per-session
 	// permission_mode/sandbox and auto_approve.
 	BypassPermissions bool `json:"bypass_permissions,omitempty"`
+
+	// DisableNetwork toggles codex's sandbox network gate. When true, the
+	// harness adds `-c sandbox_workspace_write.network_access=false` to
+	// the app-server spawn so outbound network is blocked in the sandbox
+	// layer. Orthogonal to permission_mode — both can be set independently.
+	DisableNetwork bool `json:"disable_network,omitempty"`
+
+	// PermissionModeCustom carries the raw approval/sandbox knobs picked
+	// in the bridge-ui Custom panel. Only consulted when
+	// ApprovalMode == "custom". When set, these values override codex's
+	// env-loaded defaults on the next turn.
+	PermissionModeCustom *PermissionModeCustomConfig `json:"permission_mode_custom,omitempty"`
+}
+
+// PermissionModeCustomConfig holds the raw codex-vocab knobs surfaced
+// through bridge-ui Custom mode. Approval matches codex's approval_policy
+// enum (untrusted / on-request / never); Sandbox matches sandbox_mode
+// (read-only / workspace-write / danger-full-access). Empty fields fall
+// through to codex's env defaults.
+type PermissionModeCustomConfig struct {
+	Approval string `json:"approval,omitempty"`
+	Sandbox  string `json:"sandbox,omitempty"`
 }
 
 // MessageParams matches the harness protocol message request.
