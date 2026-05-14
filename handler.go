@@ -395,6 +395,20 @@ func (b *Bridge) applyStartConfig(params StartParams) {
 			b.cfg.SandboxPolicy = params.PermissionModeCustom.Sandbox
 		}
 	}
+
+	// Host-level escape hatch: if CODEX_DISABLE_SANDBOX=1, force every
+	// session to "danger-full-access" regardless of canonical mode or
+	// Custom override. This is for hosts where bwrap can't initialize
+	// (e.g. unprivileged user namespaces without CAP_NET_ADMIN — symptom:
+	// "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted").
+	// On those hosts every codex tool call fails at sandbox setup BEFORE
+	// the model can dispatch the tool, so the bridge prehook never gets
+	// the chance to gate it. Pinning to danger-full-access skips bwrap
+	// entirely; the bridge prehook + permission-store remain the gate.
+	// MUST run last so it overrides all earlier per-mode + Custom logic.
+	if b.cfg.DisableSandbox {
+		b.cfg.SandboxPolicy = "danger-full-access"
+	}
 }
 
 // isCanonicalPermissionMode reports whether m is one of the bridge-canonical

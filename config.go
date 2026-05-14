@@ -27,16 +27,31 @@ type Config struct {
 	// `-c hooks.<EventName>=<inline-toml>` args at app-server spawn time.
 	// Empty / nil → no overrides.
 	CodexHooks json.RawMessage
+
+	// DisableSandbox is a host-level escape hatch for environments where
+	// codex's bwrap-based sandbox can't initialize (e.g. unprivileged
+	// user namespaces without CAP_NET_ADMIN, raising
+	// "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted").
+	//
+	// When true, every codex session's SandboxPolicy is pinned to
+	// "danger-full-access" regardless of the canonical permission mode
+	// (so Plan / Read / Auto / Rules / Ask All all run unsandboxed at
+	// the codex layer). The bridge prehook + permission-store remain
+	// the security gate; codex's sandbox was always defense-in-depth.
+	//
+	// Set via CODEX_DISABLE_SANDBOX=1. Off by default.
+	DisableSandbox bool
 }
 
 func loadConfig() Config {
 	cfg := Config{
-		CodexPath:     envOr("CODEX_PATH", "codex"),
-		CodexModel:    os.Getenv("CODEX_MODEL"),
-		CodexWorkdir:  os.Getenv("CODEX_WORKDIR"),
-		ApprovalMode:  envOr("CODEX_APPROVAL_MODE", "never"),
-		SandboxPolicy: envOr("CODEX_SANDBOX", "workspace-write"),
-		Effort:        os.Getenv("CODEX_EFFORT"),
+		CodexPath:      envOr("CODEX_PATH", "codex"),
+		CodexModel:     os.Getenv("CODEX_MODEL"),
+		CodexWorkdir:   os.Getenv("CODEX_WORKDIR"),
+		ApprovalMode:   envOr("CODEX_APPROVAL_MODE", "never"),
+		SandboxPolicy:  envOr("CODEX_SANDBOX", "workspace-write"),
+		Effort:         os.Getenv("CODEX_EFFORT"),
+		DisableSandbox: envBool("CODEX_DISABLE_SANDBOX"),
 	}
 
 	// CODEX_WS_PORT="0" (the default) makes the bridge pick an ephemeral
@@ -62,4 +77,14 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envBool returns true if the named env var is set to a truthy value
+// (1, true, yes — case-insensitive). Unset / empty / anything else → false.
+func envBool(key string) bool {
+	switch v := os.Getenv(key); v {
+	case "1", "true", "TRUE", "True", "yes", "YES", "Yes":
+		return true
+	}
+	return false
 }
