@@ -39,7 +39,12 @@ func loadConfig() Config {
 		Effort:        os.Getenv("CODEX_EFFORT"),
 	}
 
-	port, err := strconv.Atoi(envOr("CODEX_WS_PORT", "19836"))
+	// CODEX_WS_PORT="0" (the default) makes the bridge pick an ephemeral
+	// port via the kernel — each codex bridge process gets its own port
+	// and never collides with another concurrent session on the same host.
+	// Pin an explicit port (e.g. "19836") only when an external client
+	// needs to attach to a known port.
+	port, err := strconv.Atoi(envOr("CODEX_WS_PORT", "0"))
 	if err != nil {
 		log.Fatalf("invalid CODEX_WS_PORT: %v", err)
 	}

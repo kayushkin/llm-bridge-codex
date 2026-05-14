@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -73,15 +74,26 @@ func (a *AppServer) Client() func() *WSClient {
 	}
 }
 
-// Start spawns the app-server (if needed) and connects via WebSocket.
+// Start spawns the app-server and connects via WebSocket.
+//
+// Always spawns fresh — the prior "attach to existing instance on the same
+// port" optimization was actively harmful once per-session `-c hooks=…`
+// args landed: a new session would attach to a stale app-server that was
+// spawned with a different session's hook URL, so the prehook never
+// reached the right bridge_id and parked under the wrong session.
+//
+// If a.port is 0 the bridge picks an ephemeral port (so concurrent codex
+// sessions on the same host don't collide on a hardcoded port).
 func (a *AppServer) Start(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Try connecting to an already-running instance first.
-	if err := a.connect(); err == nil {
-		log.Printf("[appserver] connected to existing instance on port %d", a.port)
-		return nil
+	if a.port == 0 {
+		port, err := pickFreePort()
+		if err != nil {
+			return fmt.Errorf("pick free port: %w", err)
+		}
+		a.port = port
 	}
 
 	// Spawn the process.
@@ -198,4 +210,21 @@ func (a *AppServer) connect() error {
 
 	a.client = client
 	return nil
+}
+
+// pickFreePort opens a kernel-assigned TCP port on 127.0.0.1, captures
+// the port number, then closes the listener so codex can bind it.
+//
+// There's a small race window between close and codex bind where another
+// process could grab the port. In practice the kernel doesn't reassign
+// recently-released ports immediately, and a failure here surfaces as a
+// codex spawn error visible in logs (not silently wrong behavior). If
+// it becomes a problem we can retry the pick a few times.
+func pickFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
 }
