@@ -294,31 +294,67 @@ func (b *Bridge) applyStartConfig(params StartParams) {
 }
 
 // isCanonicalPermissionMode reports whether m is one of the bridge-canonical
-// values (ask/auto/bypass) rather than a codex-vocab string.
+// values rather than a codex-vocab string. Every value here MUST also have
+// a case in applyCanonicalPermissionMode.
 func isCanonicalPermissionMode(m string) bool {
 	switch m {
-	case msg.PermissionModeAsk, msg.PermissionModeAuto, msg.PermissionModeBypass:
+	case msg.PermissionModeBlockAll,
+		msg.PermissionModePlan,
+		msg.PermissionModeRead,
+		msg.PermissionModeAskAll,
+		msg.PermissionModeAsk,
+		msg.PermissionModeAuto,
+		msg.PermissionModeBypass,
+		msg.PermissionModeCustom:
 		return true
 	}
 	return false
 }
 
 // applyCanonicalPermissionMode maps the bridge-canonical mode to codex's
-// ApprovalMode + SandboxPolicy combo. Auto is interpreted as "approve
-// edits inside the workspace, ask for shell escape" which matches the
-// prehook-side auto-mode safe-tool set as closely as codex's two-axis
-// model allows.
+// ApprovalMode + SandboxPolicy combo, applied per-turn via TurnStart so the
+// mode change takes effect on the next turn without respawning codex.
+//
+// Approval policy is pinned to "never" for every gated-by-prehook mode:
+// the bridge prehook is the universal gate, and codex's own approval prompts
+// would just round-trip back through the bridge auto-approver. Sandbox
+// varies by mode:
+//
+//   - Plan / Read  → read-only (defense-in-depth: codex can't write even
+//                    if the prehook somehow let a write through)
+//   - Bypass       → danger-full-access (matches the "unrestricted" intent)
+//   - All others   → workspace-write (codex can do useful work; prehook
+//                    decides what's allowed)
+//
+// Block All / Ask All look identical to Ask at the codex layer — the
+// distinction lives in the bridge prehook's short-circuit table. Custom
+// mode leaves codex's config alone so the user's raw approval/sandbox
+// knobs (stored in HarnessConfig.permission_mode_custom) win.
 func (b *Bridge) applyCanonicalPermissionMode(mode string) {
 	switch mode {
+	case msg.PermissionModeBlockAll, msg.PermissionModeAskAll:
+		// Bridge denies/parks every call. Codex sees workspace-write+never
+		// so it never escalates; the prehook is the sole decision.
+		b.cfg.ApprovalMode = "never"
+		b.cfg.SandboxPolicy = "workspace-write"
+	case msg.PermissionModePlan, msg.PermissionModeRead:
+		// Defense-in-depth: codex's sandbox blocks writes even if the
+		// prehook whitelist somehow drifts. Approval pinned never.
+		b.cfg.ApprovalMode = "never"
+		b.cfg.SandboxPolicy = "read-only"
 	case msg.PermissionModeAsk:
 		// Codex defaults — leave ApprovalMode/SandboxPolicy alone so the env
-		// or per-call override decides.
+		// or per-call override decides. Documented architectural choice;
+		// the prehook is still the gate for this mode.
 	case msg.PermissionModeAuto:
 		b.cfg.ApprovalMode = "on-request"
 		b.cfg.SandboxPolicy = "workspace-write"
 	case msg.PermissionModeBypass:
 		b.cfg.ApprovalMode = "never"
 		b.cfg.SandboxPolicy = "danger-full-access"
+	case msg.PermissionModeCustom:
+		// Caller controls raw knobs via HarnessConfig.permission_mode_custom.
+		// Leave codex config alone so those override on the next applyStartConfig.
 	}
 }
 
@@ -441,8 +477,22 @@ func (b *Bridge) HandleSetModel(model string) {
 	log.Printf("[bridge] model changed to %s", model)
 }
 
-// HandleSetPermissionMode changes the approval policy for subsequent turns.
+// HandleSetPermissionMode changes the approval/sandbox policy for subsequent
+// turns. Accepts either canonical bridge values (ask/auto/bypass/plan/read/
+// block_all/ask_all/custom) which route through applyCanonicalPermissionMode,
+// or raw codex-vocab strings (on-request/never/granular/untrusted) which
+// pass through to ApprovalMode unchanged for back-compat with direct callers.
+//
+// Per-turn application: the next TurnStart pulls b.cfg.ApprovalMode and
+// b.cfg.SandboxPolicy, so a canonical mode change can flip both axes
+// without respawning codex.
 func (b *Bridge) HandleSetPermissionMode(mode string) {
+	if isCanonicalPermissionMode(mode) {
+		b.applyCanonicalPermissionMode(mode)
+		log.Printf("[bridge] permission mode changed to %s (approval=%s sandbox=%s)",
+			mode, b.cfg.ApprovalMode, b.cfg.SandboxPolicy)
+		return
+	}
 	b.cfg.ApprovalMode = mode
 	log.Printf("[bridge] approval mode changed to %s", mode)
 }
