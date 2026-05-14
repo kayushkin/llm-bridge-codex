@@ -41,17 +41,25 @@ type Config struct {
 	//
 	// Set via CODEX_DISABLE_SANDBOX=1. Off by default.
 	DisableSandbox bool
+
+	// BridgeServerURL is where the codex bridge POSTs approval-request
+	// gating decisions (the bridge-side proxy for codex's broken hook
+	// firing). Defaults to http://localhost:8160. Configurable via
+	// LLMBRIDGE_SERVER_URL for non-default deployments. See
+	// prehook_proxy.go for why this exists.
+	BridgeServerURL string
 }
 
 func loadConfig() Config {
 	cfg := Config{
-		CodexPath:      envOr("CODEX_PATH", "codex"),
-		CodexModel:     os.Getenv("CODEX_MODEL"),
-		CodexWorkdir:   os.Getenv("CODEX_WORKDIR"),
-		ApprovalMode:   envOr("CODEX_APPROVAL_MODE", "never"),
-		SandboxPolicy:  envOr("CODEX_SANDBOX", "workspace-write"),
-		Effort:         os.Getenv("CODEX_EFFORT"),
-		DisableSandbox: envBool("CODEX_DISABLE_SANDBOX"),
+		CodexPath:       envOr("CODEX_PATH", "codex"),
+		CodexModel:      os.Getenv("CODEX_MODEL"),
+		CodexWorkdir:    os.Getenv("CODEX_WORKDIR"),
+		ApprovalMode:    envOr("CODEX_APPROVAL_MODE", "never"),
+		SandboxPolicy:   envOr("CODEX_SANDBOX", "workspace-write"),
+		Effort:          os.Getenv("CODEX_EFFORT"),
+		DisableSandbox:  envBool("CODEX_DISABLE_SANDBOX"),
+		BridgeServerURL: envOr("LLMBRIDGE_SERVER_URL", "http://localhost:8160"),
 	}
 
 	// CODEX_WS_PORT="0" (the default) makes the bridge pick an ephemeral

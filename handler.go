@@ -65,6 +65,7 @@ func (b *Bridge) Init(ctx context.Context, sessionID, clientID string, emit func
 	b.bridgeID = sessionID
 	b.clientID = clientID
 	b.trans = NewTranslator(sessionID, clientID, emit)
+	b.trans.SetBridgeServerURL(b.cfg.BridgeServerURL)
 
 	// Open the local chain store. Failure here is fatal — without state.db we
 	// can't track resume chains and would silently regress to the
@@ -433,41 +434,46 @@ func isCanonicalPermissionMode(m string) bool {
 // ApprovalMode + SandboxPolicy combo, applied per-turn via TurnStart so the
 // mode change takes effect on the next turn without respawning codex.
 //
-// Approval policy is pinned to "never" for every gated-by-prehook mode:
-// the bridge prehook is the universal gate, and codex's own approval prompts
-// would just round-trip back through the bridge auto-approver. Sandbox
-// varies by mode:
+// approval_policy = "on-request" for every gated-by-prehook mode (NOT
+// "never"). Reason: codex 0.130's PreToolUse hooks don't fire reliably
+// upstream (issue #21639), so we use codex's NATIVE approval-request
+// flow instead — codex sends *ApprovalRequest events over the WebSocket
+// when approval_policy = on-request, and the bridge's
+// RegisterApprovalHandlers proxies each one to the bridge-server prehook
+// URL. From the user's POV the result is identical to working hooks:
+// parked-ask banner, permission-store rules, allow/deny.
 //
-//   - Plan / Read  → read-only (defense-in-depth: codex can't write even
-//                    if the prehook somehow let a write through)
-//   - Bypass       → danger-full-access (matches the "unrestricted" intent)
-//   - All others   → workspace-write (codex can do useful work; prehook
-//                    decides what's allowed)
+// Sandbox varies by mode (defense-in-depth — codex still enforces it
+// where bwrap works; on hosts where bwrap is broken, CODEX_DISABLE_SANDBOX
+// forces danger-full-access regardless):
 //
-// Block All / Ask All look identical to Ask at the codex layer — the
-// distinction lives in the bridge prehook's short-circuit table. Custom
-// mode leaves codex's config alone so the user's raw approval/sandbox
-// knobs (stored in HarnessConfig.permission_mode_custom) win.
+//   - Plan / Read  → read-only
+//   - Bypass       → danger-full-access (no gate at all on this axis)
+//   - All others   → workspace-write
+//
+// Bypass is the only mode that uses approval_policy = "never" — there's
+// nothing to gate, no need for codex to round-trip through us. Custom
+// mode leaves codex's config alone so the user's raw knobs win.
 func (b *Bridge) applyCanonicalPermissionMode(mode string) {
 	switch mode {
 	case msg.PermissionModeBlockAll, msg.PermissionModeAskAll:
-		// Bridge denies/parks every call. Codex sees workspace-write+never
-		// so it never escalates; the prehook is the sole decision.
-		b.cfg.ApprovalMode = "never"
+		// Bridge denies/parks every call via the approval-request proxy.
+		b.cfg.ApprovalMode = "on-request"
 		b.cfg.SandboxPolicy = "workspace-write"
 	case msg.PermissionModePlan, msg.PermissionModeRead:
-		// Defense-in-depth: codex's sandbox blocks writes even if the
-		// prehook whitelist somehow drifts. Approval pinned never.
-		b.cfg.ApprovalMode = "never"
+		// Defense-in-depth: codex's read-only sandbox blocks writes even
+		// if the prehook whitelist somehow drifts. Approval still routes
+		// through the bridge so the user sees a banner instead of a
+		// silent codex-side rejection.
+		b.cfg.ApprovalMode = "on-request"
 		b.cfg.SandboxPolicy = "read-only"
 	case msg.PermissionModeAsk:
-		// Bridge prehook is the gate; codex shouldn't escalate or do its
-		// own sandbox-level rejections that look like silent failures.
+		// Bridge prehook is the gate via the approval-request proxy.
 		// Explicitly reset both axes so a previous mode (e.g. Bypass →
 		// danger-full-access) doesn't leak into Ask. Without this reset,
 		// switching from Bypass back to Ask would keep the wide-open
 		// sandbox because the no-op fallthrough never wrote new values.
-		b.cfg.ApprovalMode = "never"
+		b.cfg.ApprovalMode = "on-request"
 		b.cfg.SandboxPolicy = "workspace-write"
 	case msg.PermissionModeAuto:
 		b.cfg.ApprovalMode = "on-request"

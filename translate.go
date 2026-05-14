@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"strings"
@@ -19,12 +20,27 @@ type Translator struct {
 	clientID  string // frontend correlation key (passed through unchanged)
 	emit      func(msg.Event)
 
+	// bridgeServerURL is bridge-server's base URL (no trailing slash).
+	// Used by approval-request handlers to proxy gating decisions through
+	// /permission/codex-prehook/{bridge_id} since codex's hook firing
+	// is broken upstream. Set via SetBridgeServerURL after construction.
+	bridgeServerURL string
+
 	// Per-turn accumulators.
 	text           map[string]*strings.Builder // threadID → accumulated text
 	toolCalls      map[string]int              // threadID → tool count
 	usage          map[string]*msg.TokenUsage  // threadID → latest usage
 	model          string                      // current model (from thread info or turn completion)
 	finalAnswerIDs map[string]struct{}         // item IDs that are "final_answer" phase
+}
+
+// SetBridgeServerURL configures where approval-request handlers POST
+// their gating decisions. Empty / unset disables the prehook proxy and
+// falls back to auto-approve (the legacy behavior).
+func (t *Translator) SetBridgeServerURL(url string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.bridgeServerURL = url
 }
 
 func NewTranslator(sessionID, clientID string, emit func(msg.Event)) *Translator {
@@ -666,26 +682,34 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 
 }
 
-// RegisterApprovalHandlers sets up auto-approve for all server→client requests.
+// RegisterApprovalHandlers wires codex's WebSocket *ApprovalRequest events
+// to the bridge-server prehook URL.
+//
+// Why this isn't auto-approve any more: codex 0.130's PreToolUse hook
+// firing is broken upstream (issue #21639). Instead of routing gating
+// through codex's hook layer, we use codex's NATIVE approval-request
+// flow (sent when approval_policy = on-request) and proxy each request
+// to the bridge-server prehook. The user-visible result is identical to
+// what working hooks would give us: parked-ask banner in Rules mode,
+// allow/deny per permission-store rules, etc.
+//
+// The bridge MUST be configured with approval_policy = on-request (or
+// untrusted) for codex to actually send these requests — see
+// applyCanonicalPermissionMode. Bypass mode keeps approval_policy = never
+// and never reaches these handlers.
+//
+// fail-closed: if t.bridgeServerURL is empty (legacy / unconfigured), we
+// fall back to auto-approve so we don't silently break sessions; loud log.
 func (t *Translator) RegisterApprovalHandlers(srv *AppServer) {
 	srv.OnRequest("item/commandExecution/requestApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
 		var req CommandApprovalRequest
 		if err := json.Unmarshal(params, &req); err != nil {
 			return nil, err
 		}
-		log.Printf("[approval] auto-approve command: %s", truncate(req.Command, 120))
-
-		e := t.event(msg.EventApproval)
-		e.Approval = &msg.ApprovalEvent{
-			Action:  "approve",
-			Status:  "approved",
-			ToolName: "command_execution",
-			Command: req.Command,
-		}
-		e.Raw = params
-		t.emit(e)
-
-		return json.Marshal(ApprovalResponse{Approved: true})
+		approved, reason := t.gateApproval("unified_exec", map[string]any{
+			"command": req.Command,
+		}, req.ItemID, params)
+		return json.Marshal(ApprovalResponse{Approved: approved, Reason: reason})
 	})
 
 	srv.OnRequest("item/fileChange/requestApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
@@ -693,20 +717,11 @@ func (t *Translator) RegisterApprovalHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &req); err != nil {
 			return nil, err
 		}
-		log.Printf("[approval] auto-approve file change: %s", req.Path)
-
-		e := t.event(msg.EventApproval)
-		e.Approval = &msg.ApprovalEvent{
-			Action:   "approve",
-			Status:   "approved",
-			ToolName: "file_change",
-			Path:     req.Path,
-			Patch:    req.Patch,
-		}
-		e.Raw = params
-		t.emit(e)
-
-		return json.Marshal(ApprovalResponse{Approved: true})
+		approved, reason := t.gateApproval("apply_patch", map[string]any{
+			"path":  req.Path,
+			"patch": req.Patch,
+		}, req.ItemID, params)
+		return json.Marshal(ApprovalResponse{Approved: approved, Reason: reason})
 	})
 
 	srv.OnRequest("item/permissions/requestApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
@@ -714,34 +729,15 @@ func (t *Translator) RegisterApprovalHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &req); err != nil {
 			return nil, err
 		}
-		log.Printf("[approval] auto-approve permissions: %v", req.Permissions)
-
-		e := t.event(msg.EventApproval)
-		e.Approval = &msg.ApprovalEvent{
-			Action:      "approve",
-			Status:      "approved",
-			ToolName:    "permissions",
-			Permissions: req.Permissions,
-		}
-		e.Raw = params
-		t.emit(e)
-
-		return json.Marshal(ApprovalResponse{Approved: true})
+		approved, reason := t.gateApproval("request_permissions", map[string]any{
+			"permissions": req.Permissions,
+		}, req.ItemID, params)
+		return json.Marshal(ApprovalResponse{Approved: approved, Reason: reason})
 	})
 
 	srv.OnRequest("applyPatchApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
-		log.Printf("[approval] auto-approve apply patch")
-
-		e := t.event(msg.EventApproval)
-		e.Approval = &msg.ApprovalEvent{
-			Action:   "approve",
-			Status:   "approved",
-			ToolName: "apply_patch",
-		}
-		e.Raw = params
-		t.emit(e)
-
-		return json.Marshal(ApprovalResponse{Approved: true})
+		approved, reason := t.gateApproval("apply_patch", json.RawMessage(params), "", params)
+		return json.Marshal(ApprovalResponse{Approved: approved, Reason: reason})
 	})
 
 	srv.OnRequest("execCommandApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
@@ -749,19 +745,10 @@ func (t *Translator) RegisterApprovalHandlers(srv *AppServer) {
 			Command string `json:"command,omitempty"`
 		}
 		_ = json.Unmarshal(params, &req)
-		log.Printf("[approval] auto-approve exec command: %s", truncate(req.Command, 120))
-
-		e := t.event(msg.EventApproval)
-		e.Approval = &msg.ApprovalEvent{
-			Action:   "approve",
-			Status:   "approved",
-			ToolName: "exec_command",
-			Command:  req.Command,
-		}
-		e.Raw = params
-		t.emit(e)
-
-		return json.Marshal(ApprovalResponse{Approved: true})
+		approved, reason := t.gateApproval("unified_exec", map[string]any{
+			"command": req.Command,
+		}, "", params)
+		return json.Marshal(ApprovalResponse{Approved: approved, Reason: reason})
 	})
 
 	// Headless: reject user input and dynamic tool calls.
@@ -780,6 +767,60 @@ func (t *Translator) RegisterApprovalHandlers(srv *AppServer) {
 	srv.OnRequest("account/chatgptAuthTokens/refresh", func(_ string, _ json.RawMessage) (json.RawMessage, error) {
 		return nil, &RPCError{Code: -32000, Message: "bridge does not manage auth tokens"}
 	})
+}
+
+// gateApproval is the shared body of every *ApprovalRequest handler:
+// proxy the request to bridge-server's prehook URL (or fall back to
+// auto-approve when no URL is configured), then emit an EventApproval
+// so the canonical event stream stays unchanged regardless of which
+// path was taken.
+//
+// toolName is the codex-side tool name — passed straight through to
+// permission-store, no remapping. tool_use_id correlates the approval
+// with its parked-ask banner in the UI (Item-ID from codex's payload
+// is the natural fit). rawParams is the original WebSocket payload
+// preserved on event.Raw.
+func (t *Translator) gateApproval(toolName string, toolInput any, toolUseID string, rawParams json.RawMessage) (bool, string) {
+	// Snapshot the URL + bridgeID under the lock — they can change as the
+	// session evolves (SetBridgeServerURL / SetSessionID), but each
+	// approval should use a consistent snapshot.
+	t.mu.Lock()
+	baseURL := t.bridgeServerURL
+	bridgeID := t.bridgeID
+	t.mu.Unlock()
+
+	var approved bool
+	var reason string
+	if baseURL == "" {
+		// Legacy / unconfigured: fall back to auto-approve so we don't
+		// silently break sessions. Loud log so this stays visible.
+		log.Printf("[approval] bridgeServerURL unset — falling back to auto-approve %s", toolName)
+		approved = true
+		reason = "auto-approved (no bridge URL configured)"
+	} else {
+		approved, reason = gateViaPrehook(context.Background(), baseURL, bridgeID, toolName, toolInput, toolUseID)
+	}
+
+	// Emit EventApproval so consumers (event log, UI, etc.) see the
+	// canonical record of the decision. Status reflects what we actually
+	// sent back to codex — "approved" when allowed, "denied" otherwise.
+	e := t.event(msg.EventApproval)
+	status := "approved"
+	action := "approve"
+	if !approved {
+		status = "denied"
+		action = "deny"
+	}
+	e.Approval = &msg.ApprovalEvent{
+		Action:   action,
+		Status:   status,
+		ToolName: toolName,
+		Detail:   reason,
+	}
+	e.Raw = rawParams
+	t.emit(e)
+
+	return approved, reason
 }
 
 func truncate(s string, max int) string {
