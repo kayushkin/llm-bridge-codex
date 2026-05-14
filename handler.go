@@ -447,9 +447,14 @@ func (b *Bridge) applyCanonicalPermissionMode(mode string) {
 		b.cfg.ApprovalMode = "never"
 		b.cfg.SandboxPolicy = "read-only"
 	case msg.PermissionModeAsk:
-		// Codex defaults — leave ApprovalMode/SandboxPolicy alone so the env
-		// or per-call override decides. Documented architectural choice;
-		// the prehook is still the gate for this mode.
+		// Bridge prehook is the gate; codex shouldn't escalate or do its
+		// own sandbox-level rejections that look like silent failures.
+		// Explicitly reset both axes so a previous mode (e.g. Bypass →
+		// danger-full-access) doesn't leak into Ask. Without this reset,
+		// switching from Bypass back to Ask would keep the wide-open
+		// sandbox because the no-op fallthrough never wrote new values.
+		b.cfg.ApprovalMode = "never"
+		b.cfg.SandboxPolicy = "workspace-write"
 	case msg.PermissionModeAuto:
 		b.cfg.ApprovalMode = "on-request"
 		b.cfg.SandboxPolicy = "workspace-write"
