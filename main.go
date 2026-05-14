@@ -157,7 +157,7 @@ func main() {
 			}
 
 			if params.Resume {
-				if err := bridge.HandleResumeThread(ctx, params.SessionID); err != nil {
+				if err := bridge.HandleResumeThread(ctx, params); err != nil {
 					log.Printf("resume: %v", err)
 					emitError(emit, bridge.currentSessionID(), bridge.clientID, "RESUME_FAILED", err.Error())
 				}

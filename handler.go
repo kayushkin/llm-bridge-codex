@@ -537,10 +537,15 @@ func (b *Bridge) HandleResume(ctx context.Context) error {
 // Codex mints a new thread_id on resume; we record (bridge_session_id, new
 // thread_id) under WAL so the chain survives bridge crashes — exactly the
 // stub-rollout case that motivated this design.
-func (b *Bridge) HandleResumeThread(ctx context.Context, threadID string) error {
+func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) error {
+	// applyStartConfig must run before ensureAppServer so per-session
+	// app-server args (codex_hooks, disable_network) are populated on
+	// b.cfg before the spawn.
+	b.applyStartConfig(params)
 	if err := b.ensureAppServer(ctx); err != nil {
 		return err
 	}
+	threadID := params.SessionID
 	seq := b.nextSequence()
 	parent := threadID
 	// If state.db already has rollouts for this bridge_session_id, prefer the
