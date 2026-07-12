@@ -249,7 +249,7 @@ func emitError(emit func(msg.Event), sessionID, clientID, code, message string) 
 	// StartParams; mirror it onto both fields so bridge-server can route.
 	emit(msg.Event{
 		Type:             msg.EventError,
-		Harness:          msg.HarnessCodex,
+		Harness:          harness,
 		BridgeSessionID:  sessionID,
 		HarnessSessionID: sessionID,
 		ClientRequestID:  clientID,

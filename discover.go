@@ -166,7 +166,7 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 	out := msg.StoredSession{
 		HarnessSessionID: sess.CurrentHarnessID,
 		BridgeSessionID:  sess.BridgeSessionID,
-		Harness:          msg.HarnessCodex,
+		Harness:          harness,
 		CreatedAt:        sess.CreatedAt,
 		UpdatedAt:        sess.UpdatedAt,
 		Source:           sourceFromBridgeSessionID(sess.BridgeSessionID),

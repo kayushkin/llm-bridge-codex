@@ -11,6 +11,11 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
+// harness is the identity this wrapper stamps on every event it emits and every
+// session it discovers. identity_test.go pins it to the rest of this checkout's
+// identity (module path, state dir, wrapper binary name).
+const harness = msg.HarnessCodex
+
 // Translator converts Codex app-server notifications into canonical msg.Event
 // and emits them via the provided emit function.
 type Translator struct {
@@ -67,7 +72,7 @@ func (t *Translator) SetSessionID(id string) {
 func (t *Translator) event(typ msg.EventType) msg.Event {
 	return msg.Event{
 		Type:             typ,
-		Harness:          msg.HarnessCodex,
+		Harness:          harness,
 		BridgeSessionID:  t.bridgeID,
 		HarnessSessionID: t.sessionID,
 		ClientRequestID:  t.clientID,

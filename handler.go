@@ -52,7 +52,7 @@ func (b *Bridge) currentSessionID() string {
 func (b *Bridge) event(typ msg.EventType) msg.Event {
 	return msg.Event{
 		Type:             typ,
-		Harness:          msg.HarnessCodex,
+		Harness:          harness,
 		BridgeSessionID:  b.bridgeID,
 		HarnessSessionID: b.threadID,
 		ClientRequestID:  b.clientID,
