@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
+	"github.com/kayushkin/llm-bridge/ndjson"
 )
 
 // emitEvent writes a canonical msg.Event as NDJSON to stdout.
@@ -117,13 +120,22 @@ func main() {
 	}()
 
 	// Blocking stdin read loop — process one JSON-RPC request at a time.
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
+	// ndjson.ReadLine carries no practical line cap and reports an oversized
+	// line as its own error, so a single >1MB request (a pasted image, a large
+	// tool result) no longer looks like a closed stdin and kills the session.
+	reader := bufio.NewReader(os.Stdin)
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+	for {
+		line, readErr := ndjson.ReadLine(reader, ndjson.MaxLineBytes)
+		if errors.Is(readErr, ndjson.ErrLineTooLong) {
+			log.Printf("dropping request line above %d bytes; session continues", ndjson.MaxLineBytes)
 			continue
+		}
+		if len(line) == 0 {
+			if readErr != nil {
+				break // io.EOF or a read error with no trailing data
+			}
+			continue // blank line between requests
 		}
 
 		var req struct {
@@ -232,10 +244,16 @@ func main() {
 				log.Printf("unknown method: %s", req.Method)
 			}
 		}
-	}
 
-	if err := scanner.Err(); err != nil {
-		log.Printf("stdin read error: %v", err)
+		if readErr != nil {
+			// A final unterminated line (a peer that died mid-write) is
+			// processed above, then we stop. Only io.EOF is quiet; any
+			// other reader error is worth logging.
+			if !errors.Is(readErr, io.EOF) {
+				log.Printf("stdin read error: %v", readErr)
+			}
+			break
+		}
 	}
 
 	// stdin closed — llm-bridge killed us or crashed. Clean up.
