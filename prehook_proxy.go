@@ -74,7 +74,7 @@ func gateViaPrehook(ctx context.Context, baseURL, bridgeID, toolName string, too
 		return false, fmt.Sprintf("read prehook response: %v", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		log.Printf("[prehook-proxy] HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+		log.Printf("[prehook-proxy] HTTP %d: %s", resp.StatusCode, truncateAtRuneBoundaryWithEllipsis(string(respBody), 200))
 		return false, fmt.Sprintf("prehook HTTP %d", resp.StatusCode)
 	}
 
@@ -91,7 +91,7 @@ func gateViaPrehook(ctx context.Context, baseURL, bridgeID, toolName string, too
 
 	decision := out.HookSpecificOutput.PermissionDecision
 	reason := out.HookSpecificOutput.PermissionDecisionReason
-	log.Printf("[prehook-proxy] %s → %s (%s)", toolName, decision, truncate(reason, 80))
+	log.Printf("[prehook-proxy] %s → %s (%s)", toolName, decision, truncateAtRuneBoundaryWithEllipsis(reason, 80))
 
 	// "allow" is the only outcome that permits execution. "deny" and "ask"
 	// both block — for the codex approval-request path, "ask" can't be
