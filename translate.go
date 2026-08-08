@@ -828,9 +828,19 @@ func (t *Translator) gateApproval(toolName string, toolInput any, toolUseID stri
 	return approved, reason
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
+// truncateAtRuneBoundaryWithEllipsis is truncateAtRuneBoundary with "..."
+// appended when anything was dropped, so the result runs up to maxBytes+3
+// bytes. The two names differ for that reason: a fleet grep for
+// truncateAtRuneBoundary still finds this one, and nobody reading a call site
+// has to guess whether the ellipsis is inside the budget.
+//
+// Both callers are prehook-proxy log lines — a decision reason and an HTTP
+// error body. Neither is stored or re-read, which is why this cut outlived the
+// one in discover.go, but a proxied tool's reason is model-written text and
+// carries multi-byte runes as a matter of course.
+func truncateAtRuneBoundaryWithEllipsis(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
 		return s
 	}
-	return s[:max] + "..."
+	return truncateAtRuneBoundary(s, maxBytes) + "..."
 }

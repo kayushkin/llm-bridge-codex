@@ -220,3 +220,87 @@ func writeRolloutFileWithPrompt(t *testing.T, dir, harnessID, prompt string) str
 	}
 	return path
 }
+
+// TestTruncateWithEllipsisSlidesTheCutAcrossEveryOffset covers the second cut in
+// this repo: translate.go's helper, which prehook_proxy.go uses for its two log
+// lines. It is the same walk-back with "..." appended, so the ellipsis has to be
+// stripped before the result can be judged — and the assertion that it is there
+// at all is what keeps a helper that silently returns the input from passing.
+//
+// Three offsets in every four straddle a rune; the fourth is rune-aligned and is
+// the known-negative control, which must be a plain byte cut against fixed and
+// unfixed code alike.
+func TestTruncateWithEllipsisSlidesTheCutAcrossEveryOffset(t *testing.T) {
+	s := strings.Repeat(musicalNote, 60) // 240 bytes, past the 200-byte budget
+	straddled, aligned := 0, 0
+
+	for maxBytes := 1; maxBytes < len(s); maxBytes++ {
+		got := truncateAtRuneBoundaryWithEllipsis(s, maxBytes)
+
+		body := strings.TrimSuffix(got, "...")
+		if body == got {
+			t.Fatalf("maxBytes=%d: input is over budget, so the result must carry the ellipsis; got %q", maxBytes, got)
+		}
+		if !utf8.ValidString(body) {
+			t.Fatalf("maxBytes=%d: kept text is not valid UTF-8: %q", maxBytes, body)
+		}
+		if len(body) > maxBytes {
+			t.Fatalf("maxBytes=%d: kept %d bytes, over budget", maxBytes, len(body))
+		}
+		// Maximality, without which a helper that keeps nothing passes: valid
+		// UTF-8, inside budget, and useless.
+		_, width := utf8.DecodeRuneInString(s[len(body):])
+		if len(body)+width <= maxBytes {
+			t.Fatalf("maxBytes=%d: stopped at %d bytes but the next rune (%d bytes) still fits",
+				maxBytes, len(body), width)
+		}
+
+		if maxBytes%4 == 0 {
+			aligned++
+			if body != s[:maxBytes] {
+				t.Fatalf("maxBytes=%d is rune-aligned, so the walk-back must be a no-op; kept %d bytes", maxBytes, len(body))
+			}
+			continue
+		}
+		straddled++
+		if body == s[:maxBytes] {
+			t.Fatalf("maxBytes=%d straddles a rune, so the cut must move; it did not", maxBytes)
+		}
+	}
+
+	if straddled == 0 || aligned == 0 {
+		t.Fatalf("fixture covered %d straddling and %d aligned offsets; both must be non-zero", straddled, aligned)
+	}
+}
+
+// TestTruncateWithEllipsisEdgeCases pins the branches the sliding loop cannot
+// reach: input within budget must come back untouched and WITHOUT an ellipsis,
+// and a budget of zero or less keeps no text. The byte cut this replaced
+// panicked on a negative budget — in source that is the same expression as the
+// split rune, so no scan for one can see the other.
+func TestTruncateWithEllipsisEdgeCases(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		maxBytes int
+		want     string
+	}{
+		{"ascii under budget keeps no ellipsis", "hello", 200, "hello"},
+		{"ascii exactly at budget keeps no ellipsis", "hello", 5, "hello"},
+		{"ascii over budget cuts plainly", "hello", 3, "hel..."},
+		{"empty input", "", 200, ""},
+		{"zero budget", "hello", 0, "..."},
+		{"negative budget", "hello", -1, "..."},
+		{"budget smaller than the first rune", musicalNote, 3, "..."},
+		{"budget exactly the first rune", musicalNote, 4, musicalNote},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := truncateAtRuneBoundaryWithEllipsis(c.in, c.maxBytes); got != c.want {
+				t.Fatalf("truncateAtRuneBoundaryWithEllipsis(%q, %d) = %q, want %q",
+					c.in, c.maxBytes, got, c.want)
+			}
+		})
+	}
+}
