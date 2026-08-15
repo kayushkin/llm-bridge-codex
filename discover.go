@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -226,6 +227,13 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	// The largest line this accepts is 1024*1024 - 1 bytes, not 1024*1024. A
+	// line of exactly the cap fills the buffer with no newline in it, so the
+	// token-too-long check fires before the split can succeed. The two spellings
+	// are the starting buffer and the cap, not two separate ceilings — the
+	// effective one is the larger of the two, and the zero-length starting slice
+	// only sets how much is allocated up front. Pinned from both sides by
+	// TestParseCodexSessionReadsTheLongestLineItsCeilingAllows.
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
 	metaDone := false
@@ -290,6 +298,36 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 				turns++
 			}
 		}
+	}
+
+	// bufio.Scanner ends a scan on ErrTooLong exactly as it ends one at EOF —
+	// Scan() returns false — so without this read an over-long line is
+	// indistinguishable from a clean end of file.
+	//
+	// codex loses more than claudecode and jig do here. Those two return
+	// (prompt, ts, turns); this also returns id and cwd off the session_meta
+	// line, so an over-long line BEFORE session_meta costs the session its
+	// identity and its project directory as well as its turn count. id has a
+	// fallback (extractIDFromFilename) and cwd has none — out.Project is simply
+	// left empty. Name both in the report so a blank Project has something to
+	// be traced back to.
+	//
+	// Deliberately NOT propagated: coldImportRollouts calls this from inside a
+	// filepath.WalkDir callback, where a returned error aborts the whole import
+	// and drops every session after this one. The skip-or-kill policy question
+	// is 6fbf83b3, open.
+	if err := scanner.Err(); err != nil {
+		idState := "id was read from session_meta"
+		if id == "" {
+			idState = "session_meta was never reached — id falls back to the filename"
+		}
+		cwdState := "cwd was read"
+		if cwd == "" {
+			cwdState = "cwd is empty — Project will be blank"
+		}
+		log.Printf("parseCodexSession: %s: scan stopped early: %v; "+
+			"reporting the first %d turn(s) only; %s; %s",
+			path, err, turns, idState, cwdState)
 	}
 
 	return
