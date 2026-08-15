@@ -38,6 +38,21 @@ import (
 // drifting to something reachable in a CONFIGURED session would have been a
 // silent, fleet-wide permission bypass with every suite green.
 //
+// How reachable it is TODAY, measured rather than assumed, because the paragraph
+// above reads worse than the truth and the next reader deserves the number:
+// SetBridgeServerURL has exactly one caller (handler.go:68, immediately after
+// NewTranslator), and it is passed cfg.BridgeServerURL, which comes from
+// envOr("LLMBRIDGE_SERVER_URL", "http://localhost:8160") — and envOr returns its
+// fallback for an empty env var as well as an unset one. So no configuration can
+// currently produce an empty URL, and the branch is unreachable in production.
+//
+// It is worth testing anyway, and the reason is the whole point of this file:
+// NOTHING KEEPS IT UNREACHABLE. Its unreachability is a property of one caller
+// and one helper's empty-string handling, both several files away, neither
+// mentioning the gate. A second construction site, a switch from envOr to
+// os.LookupEnv, or a config field that legitimately allows "" would each make it
+// live, and none of them would look like a permissions change while being made.
+//
 // # The five tool_input shapes permission-store actually matches on
 //
 // Each handler builds its own map, and those maps are what reach the rule engine

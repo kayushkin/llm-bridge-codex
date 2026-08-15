@@ -703,8 +703,18 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 // applyCanonicalPermissionMode. Bypass mode keeps approval_policy = never
 // and never reaches these handlers.
 //
-// fail-closed: if t.bridgeServerURL is empty (legacy / unconfigured), we
-// fall back to auto-approve so we don't silently break sessions; loud log.
+// fail-OPEN, and deliberately: if t.bridgeServerURL is empty (legacy /
+// unconfigured), we fall back to auto-approve so we don't silently break
+// sessions; loud log. gateViaPrehook below is fail-closed on every error it
+// can return, so this is the one branch on the path that lets a tool run
+// without a rule ever being consulted. This label read "fail-closed:" until
+// 2026-08-15, which is the opposite of what the sentence after it describes.
+//
+// Nothing in this function keeps that branch unreachable. It is unreachable
+// today only because SetBridgeServerURL's single caller passes
+// envOr("LLMBRIDGE_SERVER_URL", …), and envOr substitutes its fallback for an
+// empty value as well as an unset one. Pinned by
+// TestTheAutoApproveFallbackIsConfinedToAnEmptyURL.
 func (t *Translator) RegisterApprovalHandlers(srv *AppServer) {
 	srv.OnRequest("item/commandExecution/requestApproval", func(_ string, params json.RawMessage) (json.RawMessage, error) {
 		var req CommandApprovalRequest
