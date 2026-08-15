@@ -45,6 +45,13 @@ BYTECUT = ("\t\t\t\t\t\tif len(c.Text) > 200 {\n"
            "\t\t\t\t\t\t\tprompt = c.Text\n"
            "\t\t\t\t\t\t}")
 
+# The ellipsis helper's two call sites, both prehook-proxy log lines. Written
+# without surrounding indentation because each is an argument mid-line, not a
+# statement, and each appears exactly once in the file -- which the SETUP FAIL
+# check below asserts on every run rather than trusting.
+BODYCALL = "truncateAtRuneBoundaryWithEllipsis(string(respBody), 200)"
+REASONCALL = "truncateAtRuneBoundaryWithEllipsis(reason, 80)"
+
 CASES = [
     # (label, file, old, new, expect_caught)
     ("the walk-back never runs, so the cut splits a rune again",
@@ -99,6 +106,30 @@ CASES = [
      "translate.go", "if len(s) <= maxBytes {", "if len(s) < maxBytes {", True),
     ("ellipsis cut: one byte over the budget is returned whole and unmarked",
      "translate.go", "if len(s) <= maxBytes {", "if len(s) <= maxBytes+1 {", True),
+
+    # ---- the ellipsis cut's CALL SITES, scored for the first time -----------
+    # The two rows above score the helper. The helper scoring 15/15 is not a
+    # claim about the numbers its callers hand it: every test above supplies its
+    # own budget, so none of them is evidence for the 200 and the 80 that ship.
+    # Before prehook_proxy_test.go existed, gateViaPrehook had no test of any
+    # kind -- not a suite that failed to separate the budgets, no suite at all --
+    # and all four drift rows below read UNNOTICED.
+    ("the shipped HTTP-error-body budget shrinks by one byte, 200 -> 199",
+     "prehook_proxy.go", BODYCALL, BODYCALL.replace("200", "199"), True),
+    ("the shipped HTTP-error-body budget grows by one byte, 200 -> 201",
+     "prehook_proxy.go", BODYCALL, BODYCALL.replace("200", "201"), True),
+    ("the shipped decision-reason budget shrinks by one byte, 80 -> 79",
+     "prehook_proxy.go", REASONCALL, REASONCALL.replace("80", "79"), True),
+    ("the shipped decision-reason budget grows by one byte, 80 -> 81",
+     "prehook_proxy.go", REASONCALL, REASONCALL.replace("80", "81"), True),
+    # A budget that drifts is one failure; a call site that stops cutting at all
+    # is the other, and a drift row cannot see it -- there is no number left to
+    # move. Same reason discover.go carries "only the call site reverts to a
+    # plain byte cut" alongside its two budget rows.
+    ("the HTTP-error-body call site stops truncating and logs the whole body",
+     "prehook_proxy.go", BODYCALL, "string(respBody)", True),
+    ("the decision-reason call site stops truncating and logs the whole reason",
+     "prehook_proxy.go", REASONCALL, "reason", True),
 ]
 
 TESTS = ("TestTruncateAtRuneBoundarySlidesTheCutAcrossEveryOffset|"
@@ -107,7 +138,9 @@ TESTS = ("TestTruncateAtRuneBoundarySlidesTheCutAcrossEveryOffset|"
          "TestDiscoveredPromptStaysValidUTF8|"
          "TestDiscoveredLabelKeepsExactlyTheShippedBudget|"
          "TestTruncateWithEllipsisSlidesTheCutAcrossEveryOffset|"
-         "TestTruncateWithEllipsisEdgeCases")
+         "TestTruncateWithEllipsisEdgeCases|"
+         "TestPrehookErrorBodyLogKeepsExactlyTheShippedBudget|"
+         "TestPrehookDecisionReasonLogKeepsExactlyTheShippedBudget")
 
 # Messages from fixture guards rather than from an assertion about truncation.
 # A red run that shows only these is the test falling over, not detecting.
@@ -119,9 +152,21 @@ GUARD_MARKERS = (
     "marshal user line:",
     "the cut never landed inside a rune",
     "the known-negative control never ran",
+    # prehook_proxy_test.go's two fixture guards: the markers not landing on the
+    # boundary, and the log line the payload is lifted out of not being found.
+    # Neither is a statement about truncation.
+    "fixture is malformed",
+    "prehook log line not found",
 )
 
-FAIL_LINE = re.compile(r"^\s*truncate_test\.go:\d+: (.*)$", re.M)
+# Every test file whose failures count as assertions. This was the bare literal
+# "truncate_test.go" while the case list mutated one file; a second test file's
+# failures matched nothing, so classify() would have read every real detection
+# from it as "CAUGHT (no assertion text -- NOT coverage)" -- a verdict that does
+# NOT count toward the score. The four prehook drift rows would then have gone
+# from UNNOTICED to still-failing, and the tests written to close them would have
+# looked like they had not worked.
+FAIL_LINE = re.compile(r"^\s*(?:truncate_test|prehook_proxy_test)\.go:\d+: (.*)$", re.M)
 # A stack frame naming a .go file, e.g. "\t/home/u/repo/discover.go:388". The
 # full path is captured because the Go runtime's own frames (runtime/panic.go)
 # would otherwise pass a bare-filename filter and be mistaken for our source.
