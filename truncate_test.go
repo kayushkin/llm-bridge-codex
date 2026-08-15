@@ -194,6 +194,58 @@ func TestDiscoveredPromptStaysValidUTF8(t *testing.T) {
 	}
 }
 
+// TestDiscoveredLabelKeepsExactlyTheShippedBudget pins the 200 at the call site
+// — the only budget in this file that ships. Every other test here supplies its
+// own maxBytes, so none of them is a claim about the number production uses; the
+// suite above bounds the label from ABOVE ("over the 200-byte budget") and never
+// from below, which leaves the shipped budget free to shrink to any smaller
+// value with the whole suite green. Measured by sabotage in all three repos that
+// carry this helper: 200 -> 201 was caught by the length bound, 200 -> 199 was
+// UNNOTICED in every one of them.
+//
+// The assertion is on which characters survive, not on a count. Byte 200 is the
+// last one inside the budget and byte 201 the first one outside it, each marked
+// with a distinct ASCII character, so the test straddles the boundary without
+// repeating the number under test — a length assertion would have to spell 200
+// again, and a test that spells the constant it is meant to pin moves with it.
+//
+// Both markers are ASCII on purpose: this test is about the number and must not
+// depend on the rune mechanism the rest of the file exercises.
+func TestDiscoveredLabelKeepsExactlyTheShippedBudget(t *testing.T) {
+	const lastByteInsideBudget = "~"
+	const firstByteOutsideBudget = "^"
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sessionsDir := filepath.Join(home, ".codex", "sessions", "2026", "04", "30")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("mkdir sessionsDir: %v", err)
+	}
+
+	prompt := strings.Repeat("a", 199) + lastByteInsideBudget + firstByteOutsideBudget +
+		strings.Repeat("b", 50)
+	writeRolloutFileWithPrompt(t, sessionsDir, "hsid-budget", prompt)
+
+	got, err := discoverSessions()
+	if err != nil {
+		t.Fatalf("discoverSessions: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 cold-imported session, got %d", len(got))
+	}
+
+	label := got[0].Prompt
+	if !strings.HasSuffix(label, lastByteInsideBudget) {
+		t.Fatalf("the label dropped the last byte inside the budget: the shipped budget is smaller than it was: %q",
+			label)
+	}
+	if strings.Contains(label, firstByteOutsideBudget) {
+		t.Fatalf("the label kept the first byte outside the budget: the shipped budget is larger than it was: %q",
+			label)
+	}
+}
+
 // writeRolloutFileWithPrompt is writeRolloutFile with the user text under test
 // instead of a fixed "hello". Kept separate from discover_test.go's helper so
 // this file stands on its own.
