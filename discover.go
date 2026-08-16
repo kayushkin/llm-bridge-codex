@@ -296,19 +296,51 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 
 // extractIDFromFilename extracts the UUID from a Codex session filename.
 // Format: rollout-2026-04-13T02-00-13-019d8491-627f-79e1-89a7-d32ed21ee93e.jsonl
+//
+// The return value is a session KEY — it is matched against Codex rollout
+// files and stored as a session id — so a trailing 36 bytes that is not a
+// UUID is refused rather than shortened. The whole name comes back instead:
+// a wrong id that looks well-formed matches nothing while reading as stable,
+// which is harder to trace than a name that never parsed.
 func extractIDFromFilename(name string) string {
 	name = strings.TrimSuffix(name, ".jsonl")
-	// The UUID is the last 36 characters (8-4-4-4-12 with dashes)
+	// The UUID is the last 36 bytes (8-4-4-4-12 with dashes)
 	if len(name) >= 36 {
 		candidate := name[len(name)-36:]
-		// Rough UUID check: contains 4 dashes at positions 8, 13, 18, 23
-		if len(candidate) == 36 &&
-			candidate[8] == '-' && candidate[13] == '-' &&
-			candidate[18] == '-' && candidate[23] == '-' {
+		if isUUID(candidate) {
 			return candidate
 		}
 	}
 	return name
+}
+
+// isUUID reports whether s is exactly the 36-byte 8-4-4-4-12 hexadecimal form,
+// in either case. Every byte is checked, not just the four dashes: an
+// unchecked position accepts anything, including the continuation byte left
+// behind when a fixed-width cut opens in the middle of a multi-byte rune.
+// Hex digits are single-byte by definition, so a candidate that passes here is
+// valid UTF-8 without the question having to be asked separately.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if s[i] != '-' {
+				return false
+			}
+		default:
+			if !isHexDigit(s[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 // findRolloutForThread does a best-effort scan of ~/.codex/sessions/ for a
