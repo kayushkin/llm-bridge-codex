@@ -27,8 +27,9 @@ type Translator struct {
 
 	// bridgeServerURL is bridge-server's base URL (no trailing slash).
 	// Used by approval-request handlers to proxy gating decisions through
-	// /permission/codex-prehook/{bridge_id} since codex's hook firing
-	// is broken upstream. Set via SetBridgeServerURL after construction.
+	// /permission/codex-prehook/{bridge_id}. See gateViaPrehook for why the
+	// approval flow, rather than hooks, is the gate.
+	// Set via SetBridgeServerURL after construction.
 	bridgeServerURL string
 
 	// Per-turn accumulators.
@@ -78,6 +79,64 @@ func (t *Translator) event(typ msg.EventType) msg.Event {
 		ClientRequestID:  t.clientID,
 		Timestamp:        time.Now(),
 	}
+}
+
+// hookRunNotification is codex's hook/started and hook/completed payload. Both
+// carry the same shape; the phase is what distinguishes them.
+type hookRunNotification struct {
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	Run      struct {
+		ID        string `json:"id"`
+		EventName string `json:"eventName"`
+		Status    string `json:"status"`
+		Entries   []struct {
+			Kind string `json:"kind"`
+			Text string `json:"text"`
+		} `json:"entries"`
+	} `json:"run"`
+}
+
+// hookEvent builds the canonical hook event from one codex hook notification.
+//
+// Event carries codex's own name for the lifecycle point ("preToolUse", not
+// "PreToolUse"): the canonical contract asks for the harness's native names
+// without rewriting, and mapping them to Claude Code's spelling would claim an
+// equivalence the two harnesses have not agreed on.
+//
+// Decision is deliberately left empty. Codex reports a run *status* — running,
+// completed, failed, blocked, stopped — which is not the same question as the
+// allow/deny/modify decision the canonical field names. Only "blocked" carries
+// over unambiguously, so that is the one value mapped; the rest stay empty
+// rather than guessing an equivalence.
+func hookEvent(t *Translator, params json.RawMessage, phase string) msg.Event {
+	e := t.event(msg.EventHook)
+	e.Raw = params
+
+	var n hookRunNotification
+	if err := json.Unmarshal(params, &n); err != nil {
+		// A payload we cannot read is still worth reporting as a hook that ran;
+		// Raw carries the original bytes for anyone who can decode it.
+		e.Hook = &msg.HookEvent{Phase: phase}
+		return e
+	}
+
+	hook := &msg.HookEvent{
+		Event:  n.Run.EventName,
+		Phase:  phase,
+		HookID: n.Run.ID,
+	}
+	if n.Run.Status == "blocked" {
+		hook.Decision = "deny"
+	}
+	switch phase {
+	case "started":
+		hook.Input = params
+	case "completed":
+		hook.Output = params
+	}
+	e.Hook = hook
+	return e
 }
 
 func (t *Translator) resetTurn(threadID string) {
@@ -586,18 +645,18 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Hook lifecycle ---
+	//
+	// Codex reports these with a full run summary; emitting them as the
+	// canonical hook event is what lets bridge-server treat a codex hook the
+	// same way it treats a Claude Code one. Filing them as EventSystem with a
+	// subtype string reached the client as opaque text, so nothing downstream
+	// could tell which hook ran, against which tool, or whether it blocked.
 	srv.OnNotification("hook/started", func(_ string, params json.RawMessage) {
-		e := t.event(msg.EventSystem)
-		e.System = &msg.SystemEvent{Subtype: "hook_started"}
-		e.Raw = params
-		t.emit(e)
+		t.emit(hookEvent(t, params, "started"))
 	})
 
 	srv.OnNotification("hook/completed", func(_ string, params json.RawMessage) {
-		e := t.event(msg.EventSystem)
-		e.System = &msg.SystemEvent{Subtype: "hook_completed"}
-		e.Raw = params
-		t.emit(e)
+		t.emit(hookEvent(t, params, "completed"))
 	})
 
 	// --- Turn diff/plan updates ---

@@ -14,9 +14,27 @@ import (
 // gateViaPrehook proxies a codex approval-request to the bridge-server's
 // PreToolUse prehook URL and returns the decision.
 //
-// Why this exists: codex 0.130's PreToolUse hook firing is broken
-// (https://github.com/openai/codex/issues/21639) — codex doesn't call
-// the hook command even when one is configured. Instead, we configure
+// Why this exists: codex does not run PreToolUse hooks for a session the
+// app-server starts unless that session asks it to.
+//
+// Measured on codex 0.147.0, five hook events configured, one variable
+// changed between runs:
+//
+//	thread/start config {}                            → 0 hooks fired
+//	thread/start config {"bypass_hook_trust": true}    → all 5 fired
+//
+// Two things make that easy to misread, and both cost time here before:
+// the --dangerously-bypass-hook-trust CLI flag is parsed by the exec and
+// tui front ends, so it does nothing for app-server; and hooks/list keeps
+// reporting trustStatus "untrusted" for hooks that then fire, because it
+// describes stored config rather than the running thread. Upstream issue
+// 21639 reads like the same bug and is not — it is about the Desktop app.
+//
+// So hooks are reachable, and this proxy is still the gate, because a hook
+// that fires is an observation while an approval request blocks the turn
+// until answered. Turning on bypass_hook_trust would also trust hooks a
+// repository ships in .codex/hooks.json, which is a decision about running
+// third-party code, not a translation detail. Instead we configure
 // codex with `approval_policy = on-request` so codex sends its NATIVE
 // WebSocket *ApprovalRequest events to us when it's about to do
 // something potentially risky. The bridge intercepts those and routes

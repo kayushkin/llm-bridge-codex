@@ -435,9 +435,10 @@ func isCanonicalPermissionMode(m string) bool {
 // mode change takes effect on the next turn without respawning codex.
 //
 // approval_policy = "on-request" for every gated-by-prehook mode (NOT
-// "never"). Reason: codex 0.130's PreToolUse hooks don't fire reliably
-// upstream (issue #21639), so we use codex's NATIVE approval-request
-// flow instead — codex sends *ApprovalRequest events over the WebSocket
+// "never"). Reason: we gate on codex's NATIVE approval-request flow rather
+// than on hooks, because an approval request blocks the turn until it is
+// answered and a hook does not. See gateViaPrehook for the measurements
+// behind that choice — codex sends *ApprovalRequest events over the WebSocket
 // when approval_policy = on-request, and the bridge's
 // RegisterApprovalHandlers proxies each one to the bridge-server prehook
 // URL. From the user's POV the result is identical to working hooks:
