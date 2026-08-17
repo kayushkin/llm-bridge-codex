@@ -83,7 +83,8 @@ func TestDiscoverColdImportAndIdempotent(t *testing.T) {
 		}
 	}
 	// Mirror production: handler rotates current_harness_id to the latest
-	// chain head after each successful turn (see handler.go:237). Without
+	// chain head after each successful turn (handler.go calls UpsertSession
+	// with the new harness id). Without
 	// this, discover would emit HarnessSessionID="" for the seeded chains.
 	if err := seedSt.UpsertSession("bsid-A", "hsid-A2"); err != nil {
 		t.Fatalf("rotate bsid-A current_harness_id: %v", err)
