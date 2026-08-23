@@ -8,8 +8,24 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 )
+
+// escapePathSegment percent-encodes a bridge session id so it occupies exactly
+// one path segment on the wire.
+//
+// The id is assigned by the bridge-server rather than typed by a user, so this
+// is the cheap half of a gate rather than a repair of a live bypass: an id
+// carrying "/", "?" or "#" addresses some other endpoint, and the non-2xx that
+// comes back is denied by the fail-closed paths below. Escaping keeps the
+// request addressed at the rule engine, so a denial means the engine said no
+// rather than that nobody was asked.
+//
+// PathEscape is a no-op for every well-formed bridge session id.
+func escapePathSegment(segment string) string {
+	return url.PathEscape(segment)
+}
 
 // gateViaPrehook proxies a codex approval-request to the bridge-server's
 // PreToolUse prehook URL and returns the decision.
@@ -50,7 +66,7 @@ func gateViaPrehook(ctx context.Context, baseURL, bridgeID, toolName string, too
 		return false, fmt.Sprintf("marshal prehook payload: %v", err)
 	}
 
-	url := baseURL + "/permission/codex-prehook/" + bridgeID
+	url := baseURL + "/permission/codex-prehook/" + escapePathSegment(bridgeID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("[prehook-proxy] build request: %v", err)
