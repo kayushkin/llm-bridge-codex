@@ -37,6 +37,10 @@ type Translator struct {
 	usage          map[string]*msg.TokenUsage  // threadID → latest usage
 	model          string                      // current model (from thread info or turn completion)
 	finalAnswerIDs map[string]struct{}         // item IDs that are "final_answer" phase
+	startedTools   map[string]struct{}         // item IDs already emitted as tool_call
+	completedTools map[string]struct{}         // item IDs already emitted as tool_result
+	toolNames      map[string]string           // item ID → canonical name used by tool_call
+	toolOutput     map[string]*strings.Builder // item ID → output deltas retained until completion
 }
 
 // SetBridgeServerURL configures where approval-request handlers POST
@@ -58,6 +62,10 @@ func NewTranslator(sessionID, clientID string, emit func(msg.Event)) *Translator
 		toolCalls:      make(map[string]int),
 		usage:          make(map[string]*msg.TokenUsage),
 		finalAnswerIDs: make(map[string]struct{}),
+		startedTools:   make(map[string]struct{}),
+		completedTools: make(map[string]struct{}),
+		toolNames:      make(map[string]string),
+		toolOutput:     make(map[string]*strings.Builder),
 	}
 }
 
@@ -87,6 +95,232 @@ func (t *Translator) resetTurn(threadID string) {
 	delete(t.toolCalls, threadID)
 	delete(t.usage, threadID)
 	t.finalAnswerIDs = make(map[string]struct{})
+	t.startedTools = make(map[string]struct{})
+	t.completedTools = make(map[string]struct{})
+	t.toolNames = make(map[string]string)
+	t.toolOutput = make(map[string]*strings.Builder)
+}
+
+// emitToolCallOnce accepts both Codex notification dialects. Current app-server
+// versions report tool lifecycle through generic item/started and item/completed;
+// older versions used item/<kind>/started and item/<kind>/completed. A version may
+// emit both while rolling between them, so the item id is the dedup key.
+func (t *Translator) emitToolCallOnce(threadID, itemID, name string, input json.RawMessage, raw json.RawMessage) {
+	if itemID == "" {
+		return
+	}
+	t.mu.Lock()
+	if _, exists := t.startedTools[itemID]; exists {
+		t.mu.Unlock()
+		return
+	}
+	t.startedTools[itemID] = struct{}{}
+	t.toolNames[itemID] = name
+	t.toolCalls[threadID]++
+	t.mu.Unlock()
+
+	e := t.event(msg.EventToolCall)
+	e.ToolCall = &msg.ToolCallEvent{ToolID: itemID, Name: name, Input: input, MessageID: itemID}
+	e.Raw = raw
+	t.emit(e)
+}
+
+func (t *Translator) emitToolResultOnce(itemID, name, output string, isError bool, raw json.RawMessage) {
+	if itemID == "" {
+		return
+	}
+	t.mu.Lock()
+	if _, exists := t.completedTools[itemID]; exists {
+		t.mu.Unlock()
+		return
+	}
+	t.completedTools[itemID] = struct{}{}
+	if callName := t.toolNames[itemID]; callName != "" {
+		name = callName
+	}
+	t.mu.Unlock()
+
+	e := t.event(msg.EventToolResult)
+	e.ToolResult = &msg.ToolResultEvent{
+		ToolID:    itemID,
+		Name:      name,
+		Output:    output,
+		IsError:   isError,
+		MessageID: itemID,
+	}
+	e.Raw = raw
+	t.emit(e)
+}
+
+func (t *Translator) appendToolOutput(itemID, delta string) {
+	if itemID == "" || delta == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.toolOutput[itemID] == nil {
+		t.toolOutput[itemID] = &strings.Builder{}
+	}
+	t.toolOutput[itemID].WriteString(delta)
+}
+
+func (t *Translator) takeToolOutput(itemID string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	b := t.toolOutput[itemID]
+	delete(t.toolOutput, itemID)
+	if b == nil {
+		return ""
+	}
+	return b.String()
+}
+
+func marshalRaw(value any) json.RawMessage {
+	b, _ := json.Marshal(value)
+	return b
+}
+
+func rawText(value json.RawMessage) string {
+	if len(value) == 0 || string(value) == "null" {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(value, &text) == nil {
+		return text
+	}
+	return string(value)
+}
+
+func itemToolCall(item CodexItem) (string, json.RawMessage, bool) {
+	switch item.Type {
+	case "commandExecution":
+		return "command_execution", marshalRaw(struct {
+			Command        string          `json:"command"`
+			CWD            string          `json:"cwd,omitempty"`
+			PluginID       *string         `json:"pluginId,omitempty"`
+			ScriptPath     *string         `json:"scriptPath,omitempty"`
+			Source         string          `json:"source,omitempty"`
+			CommandActions json.RawMessage `json:"commandActions,omitempty"`
+		}{
+			Command: item.Command, CWD: item.CWD, PluginID: item.PluginID,
+			ScriptPath: item.ScriptPath, Source: item.Source, CommandActions: item.CommandActions,
+		}), true
+	case "fileChange":
+		return "file_change", marshalRaw(map[string]any{"changes": item.Changes}), true
+	case "mcpToolCall":
+		name := item.Tool
+		if name == "" {
+			name = "mcp_tool_call"
+		}
+		input := item.Arguments
+		if len(input) == 0 {
+			input = json.RawMessage(`{}`)
+		}
+		return name, input, true
+	case "dynamicToolCall":
+		name := item.Tool
+		if item.Namespace != nil && *item.Namespace != "" {
+			name = *item.Namespace + "." + name
+		}
+		if name == "" {
+			name = "dynamic_tool_call"
+		}
+		input := item.Arguments
+		if len(input) == 0 {
+			input = json.RawMessage(`{}`)
+		}
+		return name, input, true
+	case "collabAgentToolCall":
+		name := item.Tool
+		if name == "" {
+			name = "collab_agent_tool_call"
+		}
+		return name, marshalRaw(struct {
+			Prompt            *string  `json:"prompt,omitempty"`
+			Model             *string  `json:"model,omitempty"`
+			ReasoningEffort   *string  `json:"reasoningEffort,omitempty"`
+			SenderThreadID    string   `json:"senderThreadId,omitempty"`
+			ReceiverThreadIDs []string `json:"receiverThreadIds,omitempty"`
+		}{
+			Prompt: item.Prompt, Model: item.Model, ReasoningEffort: item.ReasoningEffort,
+			SenderThreadID: item.SenderThreadID, ReceiverThreadIDs: item.ReceiverThreadIDs,
+		}), true
+	case "webSearch":
+		return "web_search", marshalRaw(struct {
+			Query  string          `json:"query,omitempty"`
+			Action json.RawMessage `json:"action,omitempty"`
+		}{Query: item.Query, Action: item.Action}), true
+	case "imageView":
+		return "image_view", marshalRaw(map[string]any{"path": item.Path}), true
+	case "sleep":
+		return "sleep", marshalRaw(map[string]any{"durationMs": item.DurationMS}), true
+	case "imageGeneration":
+		return "image_generation", json.RawMessage(`{}`), true
+	default:
+		return "", nil, false
+	}
+}
+
+func itemToolResult(item CodexItem, streamedOutput string) (string, string, bool, bool) {
+	switch item.Type {
+	case "commandExecution":
+		output := streamedOutput
+		if item.AggregatedOutput != nil {
+			output = *item.AggregatedOutput
+		}
+		failed := item.Status == "failed" || item.Status == "declined" || (item.ExitCode != nil && *item.ExitCode != 0)
+		return "command_execution", output, failed, true
+	case "fileChange":
+		output := rawText(item.Changes)
+		if output == "" {
+			output = streamedOutput
+		}
+		return "file_change", output, item.Status == "failed" || item.Status == "declined", true
+	case "mcpToolCall":
+		name := item.Tool
+		if name == "" {
+			name = "mcp_tool_call"
+		}
+		output := rawText(item.Result)
+		failed := item.Status == "failed" || len(item.Error) > 0 && string(item.Error) != "null"
+		if failed && len(item.Error) > 0 {
+			output = rawText(item.Error)
+		}
+		return name, output, failed, true
+	case "dynamicToolCall":
+		name := item.Tool
+		if item.Namespace != nil && *item.Namespace != "" {
+			name = *item.Namespace + "." + name
+		}
+		if name == "" {
+			name = "dynamic_tool_call"
+		}
+		failed := item.Status == "failed" || item.Success != nil && !*item.Success
+		return name, rawText(item.ContentItems), failed, true
+	case "collabAgentToolCall":
+		name := item.Tool
+		if name == "" {
+			name = "collab_agent_tool_call"
+		}
+		output := rawText(marshalRaw(map[string]any{
+			"receiverThreadIds": item.ReceiverThreadIDs, "agentsStates": item.AgentsStates,
+		}))
+		return name, output, item.Status == "failed", true
+	case "webSearch":
+		return "web_search", rawText(item.Results), false, true
+	case "imageView":
+		return "image_view", item.Path, false, true
+	case "sleep":
+		return "sleep", rawText(marshalRaw(map[string]any{"durationMs": item.DurationMS})), false, true
+	case "imageGeneration":
+		output := rawText(item.Result)
+		if item.SavedPath != nil {
+			output = rawText(marshalRaw(map[string]any{"result": output, "savedPath": item.SavedPath}))
+		}
+		return "image_generation", output, item.Status == "failed", true
+	default:
+		return "", "", false, false
+	}
 }
 
 func (t *Translator) setUsage(threadID string, usage *msg.TokenUsage) {
@@ -171,10 +405,10 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 			InputTokens:     n.TokenUsage.Last.InputTokens,
 			OutputTokens:    n.TokenUsage.Last.OutputTokens,
 			TotalTokens:     n.TokenUsage.Last.TotalTokens,
-			CacheReadTokens:  n.TokenUsage.Last.CachedInputTokens,
-			ReasoningTokens:  n.TokenUsage.Last.ReasoningOutputTokens,
-			ContextTokens:    n.TokenUsage.Total.TotalTokens,
-			ContextLimit:     n.TokenUsage.ModelContextWindow,
+			CacheReadTokens: n.TokenUsage.Last.CachedInputTokens,
+			ReasoningTokens: n.TokenUsage.Last.ReasoningOutputTokens,
+			ContextTokens:   n.TokenUsage.Total.TotalTokens,
+			ContextLimit:    n.TokenUsage.ModelContextWindow,
 		}
 		t.setUsage(n.ThreadID, usage)
 	})
@@ -240,6 +474,9 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 			t.finalAnswerIDs[n.Item.ID] = struct{}{}
 			t.mu.Unlock()
 		}
+		if name, input, ok := itemToolCall(n.Item); ok {
+			t.emitToolCallOnce(n.ThreadID, n.Item.ID, name, input, params)
+		}
 
 		// Emit system event for item start (useful for debugging/observability).
 		e := t.event(msg.EventSystem)
@@ -266,6 +503,10 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 			}
 			e.Raw = params
 			t.emit(e)
+		}
+		streamedOutput := t.takeToolOutput(n.Item.ID)
+		if name, output, isError, ok := itemToolResult(n.Item, streamedOutput); ok {
+			t.emitToolResultOnce(n.Item.ID, name, output, isError, params)
 		}
 	})
 
@@ -294,6 +535,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 				Type:  msg.DeltaText,
 				Text:  n.Delta,
 			},
+			MessageID: n.ItemID,
 		}
 		e.Raw = params
 		t.emit(e)
@@ -332,19 +574,8 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		t.mu.Lock()
-		t.toolCalls[n.ThreadID]++
-		t.mu.Unlock()
-
 		input, _ := json.Marshal(map[string]string{"command": n.Command})
-		e := t.event(msg.EventToolCall)
-		e.ToolCall = &msg.ToolCallEvent{
-			ToolID: n.ItemID,
-			Name:   "command_execution",
-			Input:  input,
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolCallOnce(n.ThreadID, n.ItemID, "command_execution", input, params)
 	})
 
 	srv.OnNotification("item/commandExecution/outputDelta", func(_ string, params json.RawMessage) {
@@ -352,18 +583,10 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventStream)
-		e.Stream = &msg.HarnessStream{
-			Delta: &msg.BlockDelta{
-				Index: 0,
-				Type:  msg.DeltaText,
-				Text:  n.Delta,
-			},
-			MessageID: n.ItemID,
-			Hidden:    true,
-		}
-		e.Raw = params
-		t.emit(e)
+		// Command output is tool data, not assistant narration. Retain deltas
+		// only as a compatibility fallback; item/completed supplies the
+		// authoritative aggregatedOutput in current app-server versions.
+		t.appendToolOutput(n.ItemID, n.Delta)
 	})
 
 	srv.OnNotification("item/commandExecution/completed", func(_ string, params json.RawMessage) {
@@ -371,15 +594,12 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventToolResult)
-		e.ToolResult = &msg.ToolResultEvent{
-			ToolID:  n.ItemID,
-			Name:    "command_execution",
-			Output:  n.Output,
-			IsError: n.ExitCode != 0,
+		output := n.Output
+		streamedOutput := t.takeToolOutput(n.ItemID)
+		if output == "" {
+			output = streamedOutput
 		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolResultOnce(n.ItemID, "command_execution", output, n.ExitCode != 0, params)
 	})
 
 	// --- File changes ---
@@ -388,19 +608,8 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		t.mu.Lock()
-		t.toolCalls[n.ThreadID]++
-		t.mu.Unlock()
-
 		input, _ := json.Marshal(map[string]string{"path": n.Path})
-		e := t.event(msg.EventToolCall)
-		e.ToolCall = &msg.ToolCallEvent{
-			ToolID: n.ItemID,
-			Name:   "file_change",
-			Input:  input,
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolCallOnce(n.ThreadID, n.ItemID, "file_change", input, params)
 	})
 
 	srv.OnNotification("item/fileChange/outputDelta", func(_ string, params json.RawMessage) {
@@ -408,18 +617,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventStream)
-		e.Stream = &msg.HarnessStream{
-			Delta: &msg.BlockDelta{
-				Index: 0,
-				Type:  msg.DeltaText,
-				Text:  n.Delta,
-			},
-			MessageID: n.ItemID,
-			Hidden:    true,
-		}
-		e.Raw = params
-		t.emit(e)
+		t.appendToolOutput(n.ItemID, n.Delta)
 	})
 
 	srv.OnNotification("item/fileChange/completed", func(_ string, params json.RawMessage) {
@@ -427,14 +625,11 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventToolResult)
-		e.ToolResult = &msg.ToolResultEvent{
-			ToolID: n.ItemID,
-			Name:   "file_change",
-			Output: n.Path,
+		output := t.takeToolOutput(n.ItemID)
+		if output == "" {
+			output = n.Path
 		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolResultOnce(n.ItemID, "file_change", output, false, params)
 	})
 
 	// --- MCP tool calls ---
@@ -443,18 +638,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		t.mu.Lock()
-		t.toolCalls[n.ThreadID]++
-		t.mu.Unlock()
-
-		e := t.event(msg.EventToolCall)
-		e.ToolCall = &msg.ToolCallEvent{
-			ToolID: n.ItemID,
-			Name:   n.ToolName,
-			Input:  json.RawMessage(n.Arguments),
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolCallOnce(n.ThreadID, n.ItemID, n.ToolName, json.RawMessage(n.Arguments), params)
 	})
 
 	srv.OnNotification("item/mcpToolCall/completed", func(_ string, params json.RawMessage) {
@@ -462,14 +646,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventToolResult)
-		e.ToolResult = &msg.ToolResultEvent{
-			ToolID: n.ItemID,
-			Name:   "mcp_tool_call",
-			Output: n.Output,
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolResultOnce(n.ItemID, "mcp_tool_call", n.Output, false, params)
 	})
 
 	// --- Collab tool calls ---
@@ -478,18 +655,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		t.mu.Lock()
-		t.toolCalls[n.ThreadID]++
-		t.mu.Unlock()
-
-		e := t.event(msg.EventToolCall)
-		e.ToolCall = &msg.ToolCallEvent{
-			ToolID: n.ItemID,
-			Name:   n.ToolName,
-			Input:  json.RawMessage(n.Arguments),
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolCallOnce(n.ThreadID, n.ItemID, n.ToolName, json.RawMessage(n.Arguments), params)
 	})
 
 	srv.OnNotification("item/collabToolCall/completed", func(_ string, params json.RawMessage) {
@@ -497,14 +663,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventToolResult)
-		e.ToolResult = &msg.ToolResultEvent{
-			ToolID: n.ItemID,
-			Name:   "collab_tool_call",
-			Output: n.Output,
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolResultOnce(n.ItemID, "collab_tool_call", n.Output, false, params)
 	})
 
 	// --- Web search ---
@@ -513,19 +672,8 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		t.mu.Lock()
-		t.toolCalls[n.ThreadID]++
-		t.mu.Unlock()
-
 		input, _ := json.Marshal(map[string]string{"query": n.Query})
-		e := t.event(msg.EventToolCall)
-		e.ToolCall = &msg.ToolCallEvent{
-			ToolID: n.ItemID,
-			Name:   "web_search",
-			Input:  input,
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolCallOnce(n.ThreadID, n.ItemID, "web_search", input, params)
 	})
 
 	srv.OnNotification("item/webSearch/completed", func(_ string, params json.RawMessage) {
@@ -533,13 +681,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		e := t.event(msg.EventToolResult)
-		e.ToolResult = &msg.ToolResultEvent{
-			ToolID: n.ItemID,
-			Name:   "web_search",
-		}
-		e.Raw = params
-		t.emit(e)
+		t.emitToolResultOnce(n.ItemID, "web_search", "", false, params)
 	})
 
 	// --- Plan ---

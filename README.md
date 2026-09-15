@@ -133,10 +133,12 @@ Codex notification → canonical event mapping (selected highlights — see `tra
 | `turn/failed` | `error(TURN_FAILED)` + `session_state(error)` |
 | `item/agentMessage/delta` (final-answer phase) | `stream(DeltaText)` (also accumulated into the `result.text`) |
 | `item/reasoning/textDelta` / `…/summaryTextDelta` | `thinking` |
-| `item/commandExecution/started` / `…/completed` | `tool_call(command_execution)` / `tool_result` |
-| `item/fileChange/started` / `…/completed` | `tool_call(file_change)` / `tool_result` |
-| `item/mcpToolCall/started` / `…/completed` | `tool_call(<server-tool>)` / `tool_result` |
-| `item/webSearch/started` / `…/completed` | `tool_call(web_search)` / `tool_result` |
+| `item/started` / `item/completed` with `commandExecution` | `tool_call(command_execution)` / `tool_result` |
+| `item/started` / `item/completed` with `fileChange` | `tool_call(file_change)` / `tool_result` |
+| `item/started` / `item/completed` with `mcpToolCall` or `dynamicToolCall` | named `tool_call` / `tool_result` |
+| `item/started` / `item/completed` with `collabAgentToolCall` | named `tool_call` / `tool_result` |
+| `item/started` / `item/completed` with `webSearch`, `imageView`, `imageGeneration`, or `sleep` | typed `tool_call` / `tool_result` |
+| `item/commandExecution/outputDelta`, `item/fileChange/outputDelta` | buffered as tool data; never emitted as assistant `stream` text |
 | `thread/tokenUsage/updated` | (no event — buffered, reported on next `result`) |
 | `*ApprovalRequest` (command, file change, permissions, applyPatch, exec) | auto-`approval(approve)`, response `{approved:true}` |
 
@@ -155,10 +157,13 @@ All outbound events carry the original Codex notification payload in the `Raw` f
 ## Testing
 
 ```bash
+go test ./...
+go test -race ./...
+go vet ./...
 go build ./...
 ```
 
-There are no unit tests in this module. The harness is exercised end-to-end via the bridge-ui Conformance page (POST `http://localhost:8160/conformance/run`) and by spinning up a real session through `llm-bridge-server`.
+The translation tests cover current generic item lifecycle notifications, legacy-notification deduplication, tool classification, command-output isolation, and Codex message IDs. The harness can also be exercised end-to-end via the bridge-ui Conformance page (POST `http://localhost:8160/conformance/run`) and by spinning up a real session through `llm-bridge-server`.
 
 ## Known Gaps
 

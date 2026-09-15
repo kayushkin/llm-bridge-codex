@@ -273,16 +273,54 @@ type TokenUsageNotification struct {
 
 // ItemNotification is the generic item lifecycle event (item/started, item/completed).
 type ItemNotification struct {
-	ThreadID string `json:"threadId"`
-	TurnID   string `json:"turnId"`
-	Item     struct {
-		Type           string          `json:"type"` // "userMessage", "reasoning", "agentMessage", "commandExecution", "fileChange", etc.
-		ID             string          `json:"id"`
-		Text           string          `json:"text,omitempty"`
-		Phase          string          `json:"phase,omitempty"` // "final_answer", etc.
-		Content        json.RawMessage `json:"content,omitempty"`
-		MemoryCitation json.RawMessage `json:"memoryCitation,omitempty"`
-	} `json:"item"`
+	ThreadID string    `json:"threadId"`
+	TurnID   string    `json:"turnId"`
+	Item     CodexItem `json:"item"`
+}
+
+// CodexItem mirrors the tool-relevant portion of app-server's generated
+// ThreadItem union. json.RawMessage is used for nested protocol-owned values so
+// the adapter forwards new fields without imposing a second schema on them.
+type CodexItem struct {
+	Type                  string          `json:"type"`
+	ID                    string          `json:"id"`
+	Text                  string          `json:"text,omitempty"`
+	Phase                 string          `json:"phase,omitempty"`
+	Content               json.RawMessage `json:"content,omitempty"`
+	MemoryCitation        json.RawMessage `json:"memoryCitation,omitempty"`
+	Status                string          `json:"status,omitempty"`
+	Command               string          `json:"command,omitempty"`
+	CWD                   string          `json:"cwd,omitempty"`
+	PluginID              *string         `json:"pluginId,omitempty"`
+	ScriptPath            *string         `json:"scriptPath,omitempty"`
+	Source                string          `json:"source,omitempty"`
+	CommandActions        json.RawMessage `json:"commandActions,omitempty"`
+	AggregatedOutput      *string         `json:"aggregatedOutput,omitempty"`
+	ExitCode              *int            `json:"exitCode,omitempty"`
+	DurationMS            *int64          `json:"durationMs,omitempty"`
+	Changes               json.RawMessage `json:"changes,omitempty"`
+	Server                string          `json:"server,omitempty"`
+	Tool                  string          `json:"tool,omitempty"`
+	Arguments             json.RawMessage `json:"arguments,omitempty"`
+	AppContext            json.RawMessage `json:"appContext,omitempty"`
+	Result                json.RawMessage `json:"result,omitempty"`
+	Error                 json.RawMessage `json:"error,omitempty"`
+	Namespace             *string         `json:"namespace,omitempty"`
+	ContentItems          json.RawMessage `json:"contentItems,omitempty"`
+	Success               *bool           `json:"success,omitempty"`
+	SenderThreadID        string          `json:"senderThreadId,omitempty"`
+	ReceiverThreadIDs     []string        `json:"receiverThreadIds,omitempty"`
+	Prompt                *string         `json:"prompt,omitempty"`
+	Model                 *string         `json:"model,omitempty"`
+	ReasoningEffort       *string         `json:"reasoningEffort,omitempty"`
+	AgentsStates          json.RawMessage `json:"agentsStates,omitempty"`
+	Query                 string          `json:"query,omitempty"`
+	Action                json.RawMessage `json:"action,omitempty"`
+	Results               json.RawMessage `json:"results,omitempty"`
+	Path                  string          `json:"path,omitempty"`
+	RevisedPrompt         *string         `json:"revisedPrompt,omitempty"`
+	TransparentBackground *bool           `json:"transparentBackground,omitempty"`
+	SavedPath             *string         `json:"savedPath,omitempty"`
 }
 
 type AgentMessageDeltaNotification struct {
