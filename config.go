@@ -28,6 +28,11 @@ type Config struct {
 	// Empty / nil → no overrides.
 	CodexHooks json.RawMessage
 
+	// DisabledTools is the session's disabled_tools, tool-store names.
+	// Rendered to `--disable <feature>` / `-c web_search="disabled"` at
+	// app-server spawn time.
+	DisabledTools []string
+
 	// DisableSandbox is a host-level escape hatch for environments where
 	// codex's bwrap-based sandbox can't initialize (e.g. unprivileged
 	// user namespaces without CAP_NET_ADMIN, raising

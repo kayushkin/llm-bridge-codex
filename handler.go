@@ -137,7 +137,11 @@ func (b *Bridge) ensureAppServer(ctx context.Context) error {
 		return nil
 	}
 
-	b.app.SetExtraArgs(b.buildAppServerExtraArgs())
+	extraArgs, err := b.buildAppServerExtraArgs()
+	if err != nil {
+		return err
+	}
+	b.app.SetExtraArgs(extraArgs)
 
 	if err := b.app.Start(ctx); err != nil {
 		return fmt.Errorf("start app-server: %w", err)
@@ -157,8 +161,9 @@ func (b *Bridge) ensureAppServer(ctx context.Context) error {
 // spawn time (not per-turn) into `-c key=value` CLI arguments. Anything
 // per-turn (model, approval, sandbox) is set via TurnStart params, not
 // here. Only flags that codex's protocol exposes ONLY at the config
-// layer (e.g. sandbox_workspace_write.network_access, hooks) belong here.
-func (b *Bridge) buildAppServerExtraArgs() []string {
+// layer (e.g. sandbox_workspace_write.network_access, hooks, disabled
+// tools) belong here.
+func (b *Bridge) buildAppServerExtraArgs() ([]string, error) {
 	var args []string
 	if b.cfg.DisableNetwork {
 		args = append(args, "-c", "sandbox_workspace_write.network_access=false")
@@ -166,7 +171,12 @@ func (b *Bridge) buildAppServerExtraArgs() []string {
 	if hookArgs := b.codexHookArgs(); len(hookArgs) > 0 {
 		args = append(args, hookArgs...)
 	}
-	return args
+	disablingArgs, err := appServerArgsDisablingTools(b.cfg.DisabledTools)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, disablingArgs...)
+	return args, nil
 }
 
 // codexHookArgs translates b.cfg.CodexHooks (a JSON tree shaped like CC
@@ -345,7 +355,16 @@ func (b *Bridge) nextSequence() int {
 // permission_mode. The canonical mode is last because it's the new
 // single-source signal from bridge-server; nothing on the per-session level
 // should be able to override the user's mode choice silently.
-func (b *Bridge) applyStartConfig(params StartParams) {
+//
+// It fails on a disabled_tools name codex cannot honour, before anything is
+// spawned or recorded.
+func (b *Bridge) applyStartConfig(params StartParams) error {
+	if _, err := appServerArgsDisablingTools(params.DisabledTools); err != nil {
+		return err
+	}
+	// DisabledTools: tool-store names, turned into app-server arguments in
+	// buildAppServerExtraArgs.
+	b.cfg.DisabledTools = params.DisabledTools
 	if params.Model != "" {
 		b.cfg.CodexModel = params.Model
 	}
@@ -410,6 +429,7 @@ func (b *Bridge) applyStartConfig(params StartParams) {
 	if b.cfg.DisableSandbox {
 		b.cfg.SandboxPolicy = "danger-full-access"
 	}
+	return nil
 }
 
 // isCanonicalPermissionMode reports whether m is one of the bridge-canonical
@@ -489,7 +509,9 @@ func (b *Bridge) applyCanonicalPermissionMode(mode string) {
 
 // HandleStart creates a new thread and starts the first turn.
 func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
-	b.applyStartConfig(params)
+	if err := b.applyStartConfig(params); err != nil {
+		return err
+	}
 
 	if err := b.ensureAppServer(ctx); err != nil {
 		return err
@@ -564,9 +586,11 @@ func (b *Bridge) HandleResume(ctx context.Context) error {
 // stub-rollout case that motivated this design.
 func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) error {
 	// applyStartConfig must run before ensureAppServer so per-session
-	// app-server args (codex_hooks, disable_network) are populated on
-	// b.cfg before the spawn.
-	b.applyStartConfig(params)
+	// app-server args (codex_hooks, disable_network, disabled_tools) are
+	// populated on b.cfg before the spawn.
+	if err := b.applyStartConfig(params); err != nil {
+		return err
+	}
 	if err := b.ensureAppServer(ctx); err != nil {
 		return err
 	}
@@ -797,6 +821,13 @@ type StartParams struct {
 	// loads the hooks via its TOML override path (codex has no hooks-file
 	// flag). Empty / absent → no overrides.
 	CodexHooks json.RawMessage `json:"codex_hooks,omitempty"`
+
+	// DisabledTools is harness_config.disabled_tools from bridge-server:
+	// tool-store's codex tool names (codex feature names such as shell_tool,
+	// plus web_search). Each becomes app-server arguments that turn the tool
+	// off (see appServerArgsByDisabledToolName); an unknown name fails the
+	// start.
+	DisabledTools []string `json:"disabled_tools,omitempty"`
 }
 
 // PermissionModeCustomConfig holds the raw codex-vocab knobs surfaced

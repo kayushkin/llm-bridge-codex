@@ -119,6 +119,7 @@ Codex-specific (all optional):
 | `sandbox` | Forwarded as `thread/start.sandbox` and converted to the tagged-enum form for `turn/start.sandboxPolicy`. |
 | `effort` | Forwarded as `turn/start.effort`. |
 | `auto_approve` | Convenience boolean — sets `approval=never`, `sandbox=workspace-write`. |
+| `disabled_tools` | Tool-store's codex tool names to turn off at app-server spawn. A codex feature name (`shell_tool`, `unified_exec`, `view_image`, `image_generation`, `multi_agent`, `browser_use`, `computer_use`, `apps`, `plugins`, `sleep_tool`, `code_mode_host`) becomes `--disable <feature>`; `web_search` becomes `-c web_search="disabled"`. Any other name fails the start with an error naming it. Read once, when the app-server spawns. |
 
 ## Canonical Events Emitted
 
