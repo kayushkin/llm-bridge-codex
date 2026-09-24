@@ -59,6 +59,12 @@ func main() {
 		return
 	}
 
+	// -oneshot: one stateless, schema-forced model call on the Codex login.
+	// See oneshot.go.
+	if len(os.Args) > 1 && os.Args[1] == "-oneshot" {
+		os.Exit(runOneShot())
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "-discover" {
 		sessions, err := discoverSessions()
 		if err != nil {
