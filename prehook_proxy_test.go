@@ -124,8 +124,8 @@ func assertStraddled(t *testing.T, what, logged string) {
 // body cannot fail on a wrong URL — the fleet-wide shape card 64766783 sweeps
 // for. These tests are about two budgets and do not score the request contract,
 // but a fixture blind to it is worse than one that is not, and the assertion is
-// two lines. What is NOT yet measured here is whether anything would catch the
-// path drifting: sabotage-truncation.py scores the cut, and stays about the cut.
+// two lines. scripts/sabotage-prehook-contract.py measures whether it catches
+// the path drifting; sabotage-truncation.py scores the cut, and stays about it.
 func assertShippedRequest(t *testing.T, r *http.Request, bridgeID string) {
 	t.Helper()
 	if r.Method != http.MethodPost {

@@ -62,7 +62,7 @@ TOOL_INPUT = '\t\t"tool_input":   toolInput,'
 TOOL_USE_ID = '\t\t"tool_use_id":  toolUseID,'
 HOOK_EVENT = '\t\t"hook_event_name": "PreToolUse",'
 
-URL_BUILD = '\turl := baseURL + "/permission/codex-prehook/" + bridgeID'
+URL_BUILD = '\turl := baseURL + "/permission/codex-prehook/" + escapePathSegment(bridgeID)'
 TIMEOUT = "\tclient := &http.Client{Timeout: 24 * time.Hour}"
 STATUS_CHECK = "\tif resp.StatusCode/100 != 2 {"
 DECISION = '\treturn decision == "allow", reason'
@@ -111,7 +111,7 @@ CASES = [
     ("the path drifts to the Claude Code prehook route",
      TARGET, URL_BUILD, URL_BUILD.replace("codex-prehook", "cc-prehook"), True),
     ("the path is keyed by the tool-use id instead of the bridge id",
-     TARGET, URL_BUILD, URL_BUILD.replace("+ bridgeID", "+ toolUseID"), True),
+     TARGET, URL_BUILD, URL_BUILD.replace("escapePathSegment(bridgeID)", "escapePathSegment(toolUseID)"), True),
     ("the prehook is PUT instead of POSTed",
      TARGET, "http.MethodPost, url", "http.MethodPut, url", True),
     ("the Content-Type stops announcing JSON",
