@@ -45,5 +45,9 @@ if [ "$SMOKE" != '{"error":"prompt required"}' ]; then
 fi
 echo "    -oneshot answers in its contract"
 
+# Runner machines download this wrapper from the bridge too; the shared script
+# in llm-bridge-runner cross-builds and publishes it (todo 919fa8b7).
+( cd "$REPO_DIR" && "$REPO_DIR/../llm-bridge-runner/scripts/publish-harness-wrapper.sh" "$BIN_NAME" )
+
 "$HOME/bin/deploy-gate" record
 echo "==> Done. Rollback: the newest $USER_BIN.backup-* next to it."
