@@ -581,7 +581,8 @@ func (b *Bridge) HandleResume(ctx context.Context) error {
 	return b.startTurn(ctx, "Continue where you left off.")
 }
 
-// HandleResumeThread resumes an existing thread by ID using the ThreadResume API.
+// HandleResumeThread resumes an existing thread by ID using the ThreadResume
+// API, then starts a turn only if the start carried a prompt.
 // Codex mints a new thread_id on resume; we record (bridge_session_id, new
 // thread_id) under WAL so the chain survives bridge crashes — exactly the
 // stub-rollout case that motivated this design.
@@ -618,7 +619,17 @@ func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) err
 	b.threadID = newID
 	b.trans.SetSessionID(b.threadID)
 	log.Printf("[bridge] resumed thread %s (parent %s)", b.threadID, parent)
-	return b.startTurn(ctx, "Continue where you left off.")
+	// Resuming opens the thread and waits, as Claude Code's resume does. It
+	// used to start a "Continue where you left off." turn every time, so
+	// every respawn of a finished conversation — a mode switch back from
+	// pty, a resume after the idle reaper — put a turn nobody asked for
+	// ahead of the person's message. A turn the restart cut off is not lost
+	// by this: the server sends that turn's message again itself
+	// (autoResume in llm-bridge-server).
+	if params.Prompt == "" {
+		return nil
+	}
+	return b.startTurn(ctx, params.Prompt)
 }
 
 // HandleCompact triggers context compaction on the thread.
