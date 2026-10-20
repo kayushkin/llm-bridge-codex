@@ -327,8 +327,12 @@ func runImportHistory(threadID string) int {
 	}
 	path := findRolloutForThread(threadID)
 	if path == "" {
-		fmt.Fprintf(os.Stderr, "llm-bridge-codex -import-history: no rollout for thread %s under ~/.codex/sessions\n", threadID)
-		return 1
+		// The conformance contract: a session this harness does not have is
+		// a no-op, as -discover finding nothing is (llm-bridge-server
+		// conformance/runner.go testImport). Said on stderr, as Claude
+		// Code's wrapper says it.
+		fmt.Fprintf(os.Stderr, "import-history: no rollout for thread %s under ~/.codex/sessions (no-op)\n", threadID)
+		return 0
 	}
 	f, err := os.Open(path)
 	if err != nil {
