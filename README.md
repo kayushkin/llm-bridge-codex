@@ -59,7 +59,13 @@ Tested with `codex-cli 0.120.0`.
 
 # Discover stored sessions on disk.
 ./llm-bridge-codex -discover
+
+# Make images on the Codex login: a msg.ImageGenerationRequest on stdin,
+# a msg.ImageGenerationResponse (the saved PNG paths) on stdout.
+echo '{"prompt":"a red crab on cream paper"}' | ./llm-bridge-codex -generate-image
 ```
+
+`-generate-image` leaves on only Codex's image tool and the code mode it is reached through, passes each reference image with `-i`, and finds the images Codex saved under `$CODEX_HOME/generated_images/<thread id>/`. `generate_image.go` records what was measured.
 
 Send a JSON-RPC request to start a session and run the first turn:
 

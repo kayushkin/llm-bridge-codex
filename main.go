@@ -89,6 +89,11 @@ func main() {
 		os.Exit(runOneShot())
 	}
 
+	// -generate-image: make images on the Codex login. See generate_image.go.
+	if len(os.Args) > 1 && os.Args[1] == "-generate-image" {
+		os.Exit(runGenerateImage())
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "-discover" {
 		sessions, err := discoverSessions()
 		if err != nil {

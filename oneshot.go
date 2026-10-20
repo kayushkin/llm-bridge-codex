@@ -212,6 +212,9 @@ func runOneShot() int {
 type execResult struct {
 	lastMessage string
 	usage       msg.TokenUsage
+	// threadID is the thread.started event's id. Codex saves the images a
+	// turn generates under $CODEX_HOME/generated_images/<threadID>/.
+	threadID string
 }
 
 // readExecEvents reads codex exec's JSONL events. The answer is the last
@@ -231,8 +234,9 @@ func readExecEvents(out []byte) (execResult, error) {
 			continue
 		}
 		var event struct {
-			Type string `json:"type"`
-			Item struct {
+			Type     string `json:"type"`
+			ThreadID string `json:"thread_id"`
+			Item     struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"item"`
@@ -252,6 +256,8 @@ func readExecEvents(out []byte) (execResult, error) {
 			return result, fmt.Errorf("an event is not JSON: %v (%s)", err, truncateForError(line))
 		}
 		switch event.Type {
+		case "thread.started":
+			result.threadID = event.ThreadID
 		case "item.completed":
 			if event.Item.Type == "agent_message" {
 				result.lastMessage = event.Item.Text
