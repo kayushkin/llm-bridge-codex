@@ -42,18 +42,42 @@ func execCodexPTY() {
 		fmt.Fprintf(os.Stderr, "llm-bridge-codex pty: codex binary not found at %q: %v\n", cfg.CodexPath, err)
 		os.Exit(127)
 	}
-	if err := syscall.Exec(bin, []string{bin}, os.Environ()); err != nil {
+	args := append([]string{bin}, ptyArguments(os.Getenv("LLMBRIDGE_PTY_MODEL"), os.Getenv("LLMBRIDGE_PTY_RESUME_ID"))...)
+	if err := syscall.Exec(bin, args, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "llm-bridge-codex pty: exec %s: %v\n", bin, err)
 		os.Exit(127)
 	}
+}
+
+// ptyArguments are codex's arguments in pty mode: --no-daemon, the session's
+// model, and `resume <thread id>` when the bridge session already has a
+// conversation. Without the last two codex opened a blank conversation on its
+// default model, so switching a session from the dash to the pty lost its
+// history.
+//
+// --no-daemon keeps the thread inside this process. By default codex 0.163's
+// screen hands the thread to a shared background app-server that outlives the
+// screen and keeps the thread's writer lock, so after the bridge stopped the
+// pty to switch back to events mode, the events-mode wrapper's own app-server
+// was refused: "thread … already has an active writer".
+func ptyArguments(model, resumeThreadID string) []string {
+	args := []string{"--no-daemon"}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	if resumeThreadID != "" {
+		args = append(args, "resume", resumeThreadID)
+	}
+	return args
 }
 
 func main() {
 	// PTY mode hand-off. llm-bridge-server's StartProcessPTY launches us
 	// inside a pseudoterminal with LLMBRIDGE_PTY_MODE=1; the contract is
 	// that we exec into the upstream `codex` CLI so the pty fd connects
-	// directly to its TUI. The harness wrapper has nothing to do in pty
-	// mode — there's no AppServer connection, no msg.Event translation.
+	// directly to its TUI. There's no AppServer connection here; the events
+	// the dash shows come from the -pty-sidecar process the server starts
+	// beside this one, which follows codex's rollout file.
 	if os.Getenv("LLMBRIDGE_PTY_MODE") == "1" {
 		execCodexPTY()
 		return
@@ -75,13 +99,20 @@ func main() {
 		os.Exit(0)
 	}
 
-	// -import-history is part of the conformance contract but not yet
-	// implemented for codex. Exit 2 to signal "unsupported" rather than
-	// silently falling through to the JSON-RPC loop, which would otherwise
-	// show up as a false-positive PASS on the conformance dashboard.
+	// -import-history <thread id>: the thread's rollout as NDJSON events.
+	// See rollout_reader.go.
 	if len(os.Args) > 1 && os.Args[1] == "-import-history" {
-		fmt.Fprintln(os.Stderr, "llm-bridge-codex: -import-history not yet implemented")
-		os.Exit(2)
+		threadID := ""
+		if len(os.Args) > 2 {
+			threadID = os.Args[2]
+		}
+		os.Exit(runImportHistory(threadID))
+	}
+
+	// -pty-sidecar: follow a pty session's rollout and post its events to
+	// the bridge. See pty_sidecar.go.
+	if len(os.Args) > 1 && os.Args[1] == "-pty-sidecar" {
+		os.Exit(runPTYSidecar())
 	}
 
 	// All log output goes to stderr — stdout is reserved for NDJSON events.
