@@ -321,6 +321,20 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 
 // ListRollouts returns the rollouts for one bridge_session_id ordered by
 // sequence ascending.
+// BridgeSessionIDForHarness returns the bridge session a thread id belongs to,
+// and false when no rollout carries that id.
+func (s *State) BridgeSessionIDForHarness(harnessSessionID string) (string, bool, error) {
+	var bridgeSessionID string
+	err := s.db.QueryRow(`SELECT bridge_session_id FROM rollouts WHERE harness_session_id = ?`, harnessSessionID).Scan(&bridgeSessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return bridgeSessionID, true, nil
+}
+
 func (s *State) ListRollouts(bridgeSessionID string) ([]RolloutRow, error) {
 	rows, err := s.db.Query(`
 SELECT harness_session_id, bridge_session_id, rollout_path, sequence, COALESCE(parent_harness_id, ''), kind, created_at

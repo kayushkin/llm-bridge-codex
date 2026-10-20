@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -108,26 +109,7 @@ func coldImportRollouts(st *State, sessionsDir string) error {
 		}
 
 		info, _ := d.Info()
-		created := ts
-		if created.IsZero() && info != nil {
-			created = info.ModTime()
-		}
-
-		// Synthetic chain: bridge_session_id = harness_session_id, single
-		// rollout at sequence 0 with kind 'start' and no parent. When the
-		// user later resumes via the bridge, recordChain will append a real
-		// resume row at sequence 1 and the chain extends naturally.
-		if err := st.UpsertSession(id, id); err != nil {
-			return err
-		}
-		if err := st.InsertRollout(RolloutRow{
-			HarnessSessionID: id,
-			BridgeSessionID:  id,
-			RolloutPath:      path,
-			Sequence:         0,
-			Kind:             "start",
-			CreatedAt:        created,
-		}); err != nil {
+		if err := coldImportRollout(st, id, path, ts, info); err != nil {
 			return err
 		}
 		known[id] = struct{}{}
@@ -137,6 +119,110 @@ func coldImportRollouts(st *State, sessionsDir string) error {
 		return walkErr
 	}
 	return nil
+}
+
+// coldImportRollout records one rollout this harness has no row for.
+//
+// Synthetic chain: bridge_session_id = harness_session_id, single rollout at
+// sequence 0 with kind 'start' and no parent. When the user later resumes via
+// the bridge, recordChain will append a real resume row at sequence 1 and the
+// chain extends naturally.
+func coldImportRollout(st *State, id, path string, created time.Time, info fs.FileInfo) error {
+	if created.IsZero() && info != nil {
+		created = info.ModTime()
+	}
+	if err := st.UpsertSession(id, id); err != nil {
+		return err
+	}
+	return st.InsertRollout(RolloutRow{
+		HarnessSessionID: id,
+		BridgeSessionID:  id,
+		RolloutPath:      path,
+		Sequence:         0,
+		Kind:             "start",
+		CreatedAt:        created,
+	})
+}
+
+// discoverSessionsChangedSince is -changed-since: the sessions whose rollout
+// was written after since, in -discover's shape, so llm-bridge-server can
+// notice a conversation run in a terminal while it is up. It stats every
+// rollout and reads only the changed ones.
+func discoverSessionsChangedSince(since time.Time) ([]msg.StoredSession, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	sessionsDir := filepath.Join(home, ".codex", "sessions")
+	changed := map[string]string{} // thread id → rollout path
+	walkErr := filepath.WalkDir(sessionsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || !info.ModTime().After(since) {
+			return nil
+		}
+		id := extractIDFromFilename(d.Name())
+		if id == "" {
+			id, _, _, _, _ = parseCodexSession(path)
+		}
+		if id != "" {
+			changed[id] = path
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, fs.ErrNotExist) {
+		return nil, walkErr
+	}
+	out := make([]msg.StoredSession, 0, len(changed))
+	if len(changed) == 0 {
+		return out, nil
+	}
+
+	st, err := OpenState(DefaultStatePath())
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	for id, path := range changed {
+		bridgeSessionID, known, err := st.BridgeSessionIDForHarness(id)
+		if err != nil {
+			return nil, err
+		}
+		if !known {
+			_, _, ts, _, _ := parseCodexSession(path)
+			info, _ := os.Stat(path)
+			if err := coldImportRollout(st, id, path, ts, info); err != nil {
+				return nil, err
+			}
+			bridgeSessionID = id
+		}
+		sess, err := st.GetSession(bridgeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		if sess == nil {
+			return nil, fmt.Errorf("rollout %s names bridge session %s, which state.db has no row for", id, bridgeSessionID)
+		}
+		rollouts, err := st.ListRollouts(bridgeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		stored := buildStoredSession(*sess, rollouts)
+		// The file that changed names the conversation, and the server
+		// matches on it. The state row's current id can be empty, as it is
+		// for a session the bridge started that has not reported one.
+		stored.HarnessSessionID = id
+		out = append(out, stored)
+	}
+	return out, nil
 }
 
 // loadKnownHarnessIDs returns the set of harness_session_ids already
@@ -437,4 +523,28 @@ func truncateAtRuneBoundary(s string, maxBytes int) string {
 		cut--
 	}
 	return s[:cut]
+}
+
+// runChangedSince parses -changed-since's one argument and prints the
+// sessions as one JSON array, as -discover does.
+func runChangedSince(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "-changed-since: one RFC 3339 time is required")
+		return 2
+	}
+	since, err := time.Parse(time.RFC3339Nano, args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "-changed-since: %v\n", err)
+		return 2
+	}
+	sessions, err := discoverSessionsChangedSince(since)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "-changed-since: %v\n", err)
+		return 1
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(sessions); err != nil {
+		fmt.Fprintf(os.Stderr, "-changed-since: %v\n", err)
+		return 1
+	}
+	return 0
 }

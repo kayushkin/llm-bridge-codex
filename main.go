@@ -109,6 +109,12 @@ func main() {
 		os.Exit(runImportHistory(threadID))
 	}
 
+	// -changed-since <RFC3339 time>: the sessions whose rollout changed
+	// after that time, in -discover's shape.
+	if len(os.Args) > 1 && os.Args[1] == "-changed-since" {
+		os.Exit(runChangedSince(os.Args[2:]))
+	}
+
 	// -pty-sidecar: follow a pty session's rollout and post its events to
 	// the bridge. See pty_sidecar.go.
 	if len(os.Args) > 1 && os.Args[1] == "-pty-sidecar" {
