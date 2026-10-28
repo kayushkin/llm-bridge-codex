@@ -89,6 +89,13 @@ func runOneShot() int {
 		writeOneShotError("prompt required")
 		return 1
 	}
+	if len(request.Images) > 0 {
+		// codex exec takes images only as files on its command line, which
+		// this mode does not write; refusing lets a router try a model that
+		// can see, where answering would describe a picture it never saw.
+		writeOneShotError("this harness's oneshot mode does not send images; use a model on a harness that does")
+		return 1
+	}
 	if id := os.Getenv("LLMBRIDGE_CREDENTIAL_ID"); id != "" {
 		writeOneShotError("instance has a bound credential (" + id + "); oneshot mode runs on the Codex login and does not resolve auth-store credentials — use a session instead")
 		return 1

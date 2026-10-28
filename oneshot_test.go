@@ -163,3 +163,19 @@ func TestOneShotRefusesAnAPIKeyAndAMissingModel(t *testing.T) {
 		}
 	}
 }
+
+func TestAOneShotWithImagesIsRefusedNotAnsweredBlind(t *testing.T) {
+	directory := t.TempDir()
+	binary := filepath.Join(directory, "llm-bridge-codex")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	request, _ := json.Marshal(msg.OneShotRequest{Prompt: "who is this?", Images: []msg.OneShotImage{{MediaType: "image/png", DataBase64: "AAEC"}}})
+	command := exec.Command(binary, "-oneshot")
+	command.Stdin = strings.NewReader(string(request))
+	command.Env = []string{"HOME=" + directory, "PATH=" + os.Getenv("PATH")}
+	output, err := command.Output()
+	if err == nil || !strings.Contains(string(output), "does not send images") {
+		t.Errorf("a request with images answered %v %s, want a refusal", err, output)
+	}
+}
