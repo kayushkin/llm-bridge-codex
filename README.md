@@ -153,7 +153,9 @@ All outbound events carry the original Codex notification payload in the `Raw` f
 
 ## Session Discovery
 
-`./llm-bridge-codex -discover` walks `~/.codex/sessions/<year>/<month>/<day>/rollout-<timestamp>-<uuid>.jsonl` and emits a JSON array of `msg.StoredSession` entries (id, prompt snippet, project cwd, turn count, timestamps, file path). The session id is taken from the in-file `session_meta` payload, falling back to the trailing UUID in the filename. Used by `llm-bridge-server` to populate the "discoverable sessions" list on the bridge UI.
+`./llm-bridge-codex -discover` walks codex's rollout trees — `$CODEX_HOME/sessions/<year>/<month>/<day>/rollout-<timestamp>-<uuid>.jsonl` and `$CODEX_HOME/archived_sessions/`, with `CODEX_HOME` defaulting to `~/.codex` as codex itself does — and emits a JSON array of `msg.StoredSession` entries (id, prompt snippet, project cwd, turn count, timestamps, file path). `-changed-since <RFC 3339 time>` reads the same trees and emits only the sessions whose rollout was written after that time. The session id is taken from the in-file `session_meta` payload, falling back to the trailing UUID in the filename. Used by `llm-bridge-server` to populate the "discoverable sessions" list on the bridge UI.
+
+**The prompt is what the person typed.** codex writes text of its own as role `user` messages — the environment, the AGENTS.md instructions it loaded, a turn-aborted marker — ahead of the request. The prompt and the turn count come from the `event_msg` entries of type `user_message`, which carry exactly what was typed; a rollout from a codex that writes none falls back to the role `user` response_items, skipping every one that `msg.IsCodexInjectedText` (llm-bridge) recognises as codex's own. llm-bridge-server reads the same function to recognise a stored title that came from one.
 
 ## Interrupt and Shutdown
 
@@ -179,7 +181,7 @@ The translation tests cover current generic item lifecycle notifications, legacy
 - **`set_model` / `set_permission_mode` / `effort` updates are in-process only**: they take effect on the next `turn/start`, but no notification is sent to codex itself.
 - **Auth is chatgpt-only**: `initAuth` only forwards `auth_mode == "chatgpt"` tokens. API-key flows or other auth modes are ignored — codex falls back to ambient credentials.
 - **Single thread per process**: `b.threadID` is a single field. Resetting per `start` works, but parallel threads on one bridge process do not.
-- **`discover` shape is brittle**: see `discover.go` — assumes Codex's on-disk layout (`~/.codex/sessions/Y/M/D/rollout-…jsonl`). If Codex changes that, discovery silently returns nothing.
+- **`discover` shape is brittle**: see `discover.go` — assumes Codex's on-disk layout (`$CODEX_HOME/sessions/Y/M/D/rollout-…jsonl` and `$CODEX_HOME/archived_sessions/`). If Codex changes that, discovery silently returns nothing.
 
 ## Part of the llm-bridge ecosystem
 

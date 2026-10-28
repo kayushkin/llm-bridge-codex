@@ -38,12 +38,41 @@ import (
 // chain head (sessions.bridge_session_id); for cold-imported sessions it
 // equals the harness UUID, for bridge-spawned sessions it's the `br_*` id
 // minted by bridge-server.
-func discoverSessions() ([]msg.StoredSession, error) {
+// codexHomeDirectory is codex's own home: $CODEX_HOME, or ~/.codex when it is
+// unset, as codex itself defaults it. Rollouts, archived rollouts and
+// generated images all live under it.
+func codexHomeDirectory() (string, error) {
+	if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
+		return codexHome, nil
+	}
 	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("find the codex home: %w", err)
+	}
+	return filepath.Join(home, ".codex"), nil
+}
+
+// codexRolloutDirectories are the trees codex writes rollout files into:
+// sessions/ for live conversations and archived_sessions/ for the ones a
+// person archived. Discovery reads both, so an archived conversation is still
+// a session the dash knows. Until 2026-10-28 only ~/.codex/sessions was read,
+// whatever CODEX_HOME said.
+func codexRolloutDirectories() ([]string, error) {
+	codexHome, err := codexHomeDirectory()
 	if err != nil {
 		return nil, err
 	}
-	sessionsDir := filepath.Join(home, ".codex", "sessions")
+	return []string{
+		filepath.Join(codexHome, "sessions"),
+		filepath.Join(codexHome, "archived_sessions"),
+	}, nil
+}
+
+func discoverSessions() ([]msg.StoredSession, error) {
+	rolloutDirectories, err := codexRolloutDirectories()
+	if err != nil {
+		return nil, err
+	}
 
 	st, err := OpenState(DefaultStatePath())
 	if err != nil {
@@ -51,8 +80,10 @@ func discoverSessions() ([]msg.StoredSession, error) {
 	}
 	defer st.Close()
 
-	if err := coldImportRollouts(st, sessionsDir); err != nil {
-		return nil, err
+	for _, rolloutDirectory := range rolloutDirectories {
+		if err := coldImportRollouts(st, rolloutDirectory); err != nil {
+			return nil, err
+		}
 	}
 
 	all, err := st.AllSessions()
@@ -149,37 +180,15 @@ func coldImportRollout(st *State, id, path string, created time.Time, info fs.Fi
 // notice a conversation run in a terminal while it is up. It stats every
 // rollout and reads only the changed ones.
 func discoverSessionsChangedSince(since time.Time) ([]msg.StoredSession, error) {
-	home, err := os.UserHomeDir()
+	rolloutDirectories, err := codexRolloutDirectories()
 	if err != nil {
 		return nil, err
 	}
-	sessionsDir := filepath.Join(home, ".codex", "sessions")
 	changed := map[string]string{} // thread id → rollout path
-	walkErr := filepath.WalkDir(sessionsDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
-				return nil
-			}
-			return err
+	for _, rolloutDirectory := range rolloutDirectories {
+		if err := collectRolloutsChangedSince(rolloutDirectory, since, changed); err != nil {
+			return nil, err
 		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil || !info.ModTime().After(since) {
-			return nil
-		}
-		id := extractIDFromFilename(d.Name())
-		if id == "" {
-			id, _, _, _, _ = parseCodexSession(path)
-		}
-		if id != "" {
-			changed[id] = path
-		}
-		return nil
-	})
-	if walkErr != nil && !errors.Is(walkErr, fs.ErrNotExist) {
-		return nil, walkErr
 	}
 	out := make([]msg.StoredSession, 0, len(changed))
 	if len(changed) == 0 {
@@ -223,6 +232,40 @@ func discoverSessionsChangedSince(since time.Time) ([]msg.StoredSession, error) 
 		out = append(out, stored)
 	}
 	return out, nil
+}
+
+// collectRolloutsChangedSince adds to changed every rollout under
+// rolloutDirectory written after since, keyed by thread id. A missing
+// directory adds nothing: archived_sessions does not exist until a person
+// archives a conversation.
+func collectRolloutsChangedSince(rolloutDirectory string, since time.Time, changed map[string]string) error {
+	walkErr := filepath.WalkDir(rolloutDirectory, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || !info.ModTime().After(since) {
+			return nil
+		}
+		id := extractIDFromFilename(d.Name())
+		if id == "" {
+			id, _, _, _, _ = parseCodexSession(path)
+		}
+		if id != "" {
+			changed[id] = path
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, fs.ErrNotExist) {
+		return walkErr
+	}
+	return nil
 }
 
 // loadKnownHarnessIDs returns the set of harness_session_ids already
@@ -323,7 +366,8 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
 	metaDone := false
-	promptDone := false
+	var typedPrompt, userItemPrompt string
+	var typedTurns, userItemTurns int
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -355,8 +399,29 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 			}
 		}
 
-		// Find user input for prompt snippet (skip environment_context preamble).
-		if !promptDone && entry.Type == "response_item" {
+		// What the person typed. codex records each message twice: as an
+		// event_msg of type user_message, which carries exactly what was
+		// typed, and as a response_item with role "user", alongside the
+		// items codex itself writes with that role — the environment, the
+		// AGENTS.md instructions it loaded, a turn-aborted marker. Titling
+		// from the first response_item is how 115 of one machine's 130
+		// discovered sessions came to be named after their instructions.
+		// So user_message wins wherever the rollout has it; a rollout from a
+		// codex that writes none falls back to the response_items, skipping
+		// codex's own text (msg.IsCodexInjectedText).
+		if entry.Type == "event_msg" {
+			var event struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(entry.Payload, &event) == nil && event.Type == "user_message" && strings.TrimSpace(event.Message) != "" && !msg.IsCodexInjectedText(event.Message) {
+				typedTurns++
+				if typedPrompt == "" {
+					typedPrompt = truncateAtRuneBoundary(event.Message, 200)
+				}
+			}
+		}
+		if entry.Type == "response_item" {
 			var item struct {
 				Role    string `json:"role"`
 				Content []struct {
@@ -366,24 +431,22 @@ func parseCodexSession(path string) (id, prompt string, ts time.Time, cwd string
 			}
 			if json.Unmarshal(entry.Payload, &item) == nil && item.Role == "user" {
 				for _, c := range item.Content {
-					if c.Type == "input_text" && c.Text != "" && !strings.HasPrefix(c.Text, "<environment_context>") {
-						promptDone = true
-						prompt = truncateAtRuneBoundary(c.Text, 200)
+					if c.Type == "input_text" && strings.TrimSpace(c.Text) != "" && !msg.IsCodexInjectedText(c.Text) {
+						userItemTurns++
+						if userItemPrompt == "" {
+							userItemPrompt = truncateAtRuneBoundary(c.Text, 200)
+						}
 						break
 					}
 				}
 			}
 		}
+	}
 
-		// Count user turns.
-		if entry.Type == "response_item" {
-			var item struct {
-				Role string `json:"role"`
-			}
-			if json.Unmarshal(entry.Payload, &item) == nil && item.Role == "user" {
-				turns++
-			}
-		}
+	if typedTurns > 0 {
+		prompt, turns = typedPrompt, typedTurns
+	} else {
+		prompt, turns = userItemPrompt, userItemTurns
 	}
 
 	// bufio.Scanner ends a scan on ErrTooLong exactly as it ends one at EOF —
@@ -468,7 +531,7 @@ func isHexDigit(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
-// findRolloutForThread does a best-effort scan of ~/.codex/sessions/ for a
+// findRolloutForThread does a best-effort scan of codex's rollout trees for a
 // rollout file whose name carries the given thread_id. Returns "" if not
 // found — caller treats that as "rollout file not yet on disk" and proceeds
 // without the path. The path can be backfilled later by re-globbing.
@@ -476,22 +539,26 @@ func findRolloutForThread(threadID string) string {
 	if threadID == "" {
 		return ""
 	}
-	home, err := os.UserHomeDir()
+	rolloutDirectories, err := codexRolloutDirectories()
 	if err != nil {
 		return ""
 	}
-	sessionsDir := filepath.Join(home, ".codex", "sessions")
 	var found string
-	_ = filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	for _, rolloutDirectory := range rolloutDirectories {
+		_ = filepath.WalkDir(rolloutDirectory, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(d.Name(), ".jsonl") && strings.Contains(d.Name(), threadID) {
+				found = path
+				return filepath.SkipAll
+			}
 			return nil
+		})
+		if found != "" {
+			return found
 		}
-		if strings.HasSuffix(d.Name(), ".jsonl") && strings.Contains(d.Name(), threadID) {
-			found = path
-			return filepath.SkipAll
-		}
-		return nil
-	})
+	}
 	return found
 }
 

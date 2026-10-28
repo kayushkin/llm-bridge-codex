@@ -175,13 +175,9 @@ func runGenerateImage() int {
 // $CODEX_HOME/generated_images, CODEX_HOME being ~/.codex when unset, as
 // codex itself defaults it.
 func codexGeneratedImagesDirectory() (string, error) {
-	codexHome := os.Getenv("CODEX_HOME")
-	if codexHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("find the codex home: %w", err)
-		}
-		codexHome = filepath.Join(home, ".codex")
+	codexHome, err := codexHomeDirectory()
+	if err != nil {
+		return "", err
 	}
 	return filepath.Join(codexHome, "generated_images"), nil
 }
