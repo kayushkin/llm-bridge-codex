@@ -581,6 +581,47 @@ func (b *Bridge) HandleResume(ctx context.Context) error {
 	return b.startTurn(ctx, "Continue where you left off.")
 }
 
+// threadToResume is the codex thread a resume continues. state.db is the
+// bridge-local source of truth, so the latest rollout of this session's chain
+// wins over what bridge-server sent, which may be a value it cached before
+// the last resume. The chain is found under the bridge session id, or, for a
+// session discovered on disk (whose rollouts state.db filed under its thread
+// id), under the chain that thread id belongs to. With no chain, the thread id
+// bridge-server sent is the one to resume. With none of these there is nothing
+// to resume, which is an error here rather than a request codex refuses.
+func threadToResume(state *State, bridgeSessionID string, params StartParams) (string, error) {
+	latestOf := func(chainID string) (string, error) {
+		rollouts, err := state.ListRollouts(chainID)
+		if err != nil {
+			return "", fmt.Errorf("read rollouts of %s: %w", chainID, err)
+		}
+		if len(rollouts) == 0 {
+			return "", nil
+		}
+		return rollouts[len(rollouts)-1].HarnessSessionID, nil
+	}
+	if thread, err := latestOf(bridgeSessionID); err != nil || thread != "" {
+		return thread, err
+	}
+	sentThread := params.HarnessSessionID
+	if sentThread == "" {
+		sentThread = params.SessionID // older bridge-server binaries
+	}
+	if sentThread == "" {
+		return "", fmt.Errorf("resume %s: state.db has no rollout for it and bridge-server sent no harness_session_id, so there is no codex thread to resume", bridgeSessionID)
+	}
+	chainID, found, err := state.BridgeSessionIDForHarness(sentThread)
+	if err != nil {
+		return "", fmt.Errorf("find the chain of thread %s: %w", sentThread, err)
+	}
+	if found {
+		if thread, err := latestOf(chainID); err != nil || thread != "" {
+			return thread, err
+		}
+	}
+	return sentThread, nil
+}
+
 // HandleResumeThread resumes an existing thread by ID using the ThreadResume
 // API, then starts a turn only if the start carried a prompt.
 // Codex mints a new thread_id on resume; we record (bridge_session_id, new
@@ -596,16 +637,11 @@ func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) err
 	if err := b.ensureAppServer(ctx); err != nil {
 		return err
 	}
-	threadID := params.SessionID
-	seq := b.nextSequence()
-	parent := threadID
-	// If state.db already has rollouts for this bridge_session_id, prefer the
-	// latest committed harness id as the parent — server-passed threadID may
-	// be stale (e.g. an older value bridge-server cached before our last
-	// resume). state.db is the bridge-local source of truth.
-	if rs, err := b.state.ListRollouts(b.bridgeID); err == nil && len(rs) > 0 {
-		parent = rs[len(rs)-1].HarnessSessionID
+	parent, err := threadToResume(b.state, b.bridgeID, params)
+	if err != nil {
+		return err
 	}
+	seq := b.nextSequence()
 	newID, err := b.recordChain("resume", parent, seq, func() (string, error) {
 		result, err := b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: parent})
 		if err != nil {
@@ -783,19 +819,25 @@ type StartParams struct {
 	// from BridgeSessionID first and fall back if it's empty.
 	BridgeSessionID string `json:"bridge_session_id,omitempty"`
 	SessionID       string `json:"session_id"`
-	ClientID        string `json:"client_id,omitempty"`
-	DisplayName    string `json:"display_name,omitempty"`
-	AgentID        string `json:"agent_id,omitempty"`
-	Prompt         string `json:"prompt,omitempty"`
-	Resume         bool   `json:"resume,omitempty"`
-	Fork           string `json:"fork,omitempty"`
-	Model          string `json:"model,omitempty"`
-	WorkDir        string `json:"work_dir,omitempty"`
-	ApprovalMode   string `json:"permission_mode,omitempty"`
-	Sandbox        string `json:"sandbox,omitempty"`
-	SystemPrompt   string `json:"system_prompt,omitempty"`
-	Effort         string `json:"effort,omitempty"`
-	AutoApprove    *bool  `json:"auto_approve,omitempty"`
+	// HarnessSessionID is the codex thread id bridge-server has for the
+	// session (`harness_session_id`), which it sends on every resume. Until
+	// 2026-10-28 this struct had no such field, so a session whose rollouts
+	// state.db files under another id (one discovered on disk, keyed by its
+	// thread id) resumed with no thread id and codex refused it.
+	HarnessSessionID string `json:"harness_session_id,omitempty"`
+	ClientID         string `json:"client_id,omitempty"`
+	DisplayName      string `json:"display_name,omitempty"`
+	AgentID          string `json:"agent_id,omitempty"`
+	Prompt           string `json:"prompt,omitempty"`
+	Resume           bool   `json:"resume,omitempty"`
+	Fork             string `json:"fork,omitempty"`
+	Model            string `json:"model,omitempty"`
+	WorkDir          string `json:"work_dir,omitempty"`
+	ApprovalMode     string `json:"permission_mode,omitempty"`
+	Sandbox          string `json:"sandbox,omitempty"`
+	SystemPrompt     string `json:"system_prompt,omitempty"`
+	Effort           string `json:"effort,omitempty"`
+	AutoApprove      *bool  `json:"auto_approve,omitempty"`
 
 	// BypassPermissions is the canonical "this session is bypassed" signal
 	// forwarded by bridge-server when the user has the global Bypass
