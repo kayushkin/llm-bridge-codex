@@ -73,7 +73,7 @@ func TestRolloutBeforeSeptemberDialect(t *testing.T) {
 		t.Errorf("tool call/result = %+v / %+v", events[1].ToolCall, events[2].ToolResult)
 	}
 	result := events[4].Result
-	if result.Text != "4" || result.Model != "gpt-5.4" || result.Usage.InputTokens != 100 || result.Usage.CacheReadTokens != 10 || result.Usage.ContextLimit != 258400 {
+	if result.Text != "4" || result.Model != "gpt-5.4" || result.Usage.InputTokens != 90 || result.Usage.CacheReadTokens != 10 || result.Usage.ContextTokens != 100 || result.Usage.ContextLimit != 258400 {
 		t.Errorf("result = %+v", result)
 	}
 	for _, ev := range events {

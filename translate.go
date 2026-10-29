@@ -382,10 +382,17 @@ func itemToolResult(item CodexItem, streamedOutput string) (string, string, bool
 	}
 }
 
-func (t *Translator) setUsage(threadID string, usage *msg.TokenUsage) {
+// addCallUsage adds one model call to the thread's current turn; resetTurn
+// clears it when the turn's result has been sent.
+func (t *Translator) addCallUsage(threadID string, call codexCallUsage, contextLimit int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.usage[threadID] = usage
+	turn := t.usage[threadID]
+	if turn == nil {
+		turn = &msg.TokenUsage{}
+		t.usage[threadID] = turn
+	}
+	addCallToTurnUsage(turn, call, contextLimit)
 }
 
 func (t *Translator) getUsage(threadID string) msg.TokenUsage {
@@ -460,16 +467,13 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
 		}
-		usage := &msg.TokenUsage{
-			InputTokens:     n.TokenUsage.Last.InputTokens,
-			OutputTokens:    n.TokenUsage.Last.OutputTokens,
-			TotalTokens:     n.TokenUsage.Last.TotalTokens,
-			CacheReadTokens: n.TokenUsage.Last.CachedInputTokens,
-			ReasoningTokens: n.TokenUsage.Last.ReasoningOutputTokens,
-			ContextTokens:   n.TokenUsage.Total.TotalTokens,
-			ContextLimit:    n.TokenUsage.ModelContextWindow,
-		}
-		t.setUsage(n.ThreadID, usage)
+		last := n.TokenUsage.Last
+		t.addCallUsage(n.ThreadID, codexCallUsage{
+			InputTokens:           last.InputTokens,
+			CachedInputTokens:     last.CachedInputTokens,
+			OutputTokens:          last.OutputTokens,
+			ReasoningOutputTokens: last.ReasoningOutputTokens,
+		}, n.TokenUsage.ModelContextWindow)
 	})
 
 	srv.OnNotification("turn/completed", func(_ string, params json.RawMessage) {

@@ -181,15 +181,12 @@ func (r *rolloutReader) translateEventMsg(p rolloutPayload, ts time.Time) []msg.
 	case "token_count":
 		if p.Info != nil {
 			last := p.Info.LastTokenUsage
-			r.usage = msg.TokenUsage{
-				InputTokens:     last.InputTokens,
-				OutputTokens:    last.OutputTokens,
-				TotalTokens:     last.TotalTokens,
-				CacheReadTokens: last.CachedInputTokens,
-				ReasoningTokens: last.ReasoningOutputTokens,
-				ContextTokens:   p.Info.TotalTokenUsage.TotalTokens,
-				ContextLimit:    p.Info.ModelContextWindow,
-			}
+			addCallToTurnUsage(&r.usage, codexCallUsage{
+				InputTokens:           last.InputTokens,
+				CachedInputTokens:     last.CachedInputTokens,
+				OutputTokens:          last.OutputTokens,
+				ReasoningOutputTokens: last.ReasoningOutputTokens,
+			}, p.Info.ModelContextWindow)
 		}
 	case "task_complete":
 		e := msg.Event{Type: msg.EventResult, Result: &msg.ResultEvent{
