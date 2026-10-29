@@ -104,24 +104,25 @@ func main() {
 		os.Exit(0)
 	}
 
-	// -import-history <thread id>: the thread's rollout as NDJSON events.
-	// See rollout_reader.go.
-	if len(os.Args) > 1 && os.Args[1] == "-import-history" {
-		threadID := ""
-		if len(os.Args) > 2 {
-			threadID = os.Args[2]
+	// The local durable history contains every raw rollout record. Keep its
+	// lossless import contract while using upstream's live PTY reader below.
+	if len(os.Args) > 1 && os.Args[1] == "-history-revision" {
+		if err := runHistoryRevision(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "history-revision: %v\n", err)
+			os.Exit(1)
 		}
-		os.Exit(runImportHistory(threadID))
+		os.Exit(0)
 	}
-
-	// -changed-since <RFC3339 time>: the sessions whose rollout changed
-	// after that time, in -discover's shape.
+	if len(os.Args) > 1 && os.Args[1] == "-import-history" {
+		if err := runHistoryImport(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "import-history: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-changed-since" {
 		os.Exit(runChangedSince(os.Args[2:]))
 	}
-
-	// -pty-sidecar: follow a pty session's rollout and post its events to
-	// the bridge. See pty_sidecar.go.
 	if len(os.Args) > 1 && os.Args[1] == "-pty-sidecar" {
 		os.Exit(runPTYSidecar())
 	}

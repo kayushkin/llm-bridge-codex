@@ -192,3 +192,28 @@ The translation tests cover current generic item lifecycle notifications, legacy
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).
+
+### Import stored history
+
+`llm-bridge-codex -import-history SESSION_ID [ROLLOUT_PATH]` emits canonical
+bridge events as NDJSON without starting Codex or sending a model request.
+Without an explicit path, the session must first be registered by `-discover`.
+An unknown registered session is a reported no-op, matching the harness import
+contract. An unreadable, malformed, or mismatched rollout fails with an error.
+
+Each record is retained in `raw`, including metadata and unsupported record
+kinds. User and assistant response items and tool calls/results supply the reading
+view; mirrored event notifications remain in the raw
+timeline. Original timestamps, turn IDs, and native message/tool IDs are retained.
+Encrypted reasoning remains in the raw record and is not presented as readable
+text. This command converts history; the bridge owns persistence and session
+ownership. Discovery alone does not assign an owner to local sessions.
+
+### Discovered session provenance
+
+Discovery uses Codex `session_meta` provenance: explicit `thread_source: "user"`
+is a chat (interactive), and a structured `source.subagent` is a subagent
+(system type, Subagents folder). Subagents forward `parent_thread_id` through
+`parent_harness_session_id` so the server resolves their manager relationship.
+Existing conformance tags take precedence. Missing or unknown provenance stays
+unclassified; long turns, prompts, and parent IDs alone do not imply autonomy.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -97,7 +98,11 @@ func discoverSessions() ([]msg.StoredSession, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, buildStoredSession(sess, rollouts))
+		stored := buildStoredSession(sess, rollouts)
+		if err := classifyStoredSession(&stored); err != nil {
+			return nil, fmt.Errorf("classify Codex session %s: %w", stored.HarnessSessionID, err)
+		}
+		out = append(out, stored)
 	}
 	return out, nil
 }
@@ -229,6 +234,9 @@ func discoverSessionsChangedSince(since time.Time) ([]msg.StoredSession, error) 
 		// matches on it. The state row's current id can be empty, as it is
 		// for a session the bridge started that has not reported one.
 		stored.HarnessSessionID = id
+		if err := classifyStoredSession(&stored); err != nil {
+			return nil, err
+		}
 		out = append(out, stored)
 	}
 	return out, nil
@@ -614,4 +622,67 @@ func runChangedSince(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// classifyStoredSession uses explicit Codex provenance, never prompt contents or
+// activity duration. Missing provenance remains unclassified.
+func classifyStoredSession(out *msg.StoredSession) error {
+	if out.Path == "" {
+		return nil
+	}
+	f, err := os.Open(out.Path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	reader := bufio.NewReader(f)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(strings.TrimSpace(string(line))) > 0 {
+			var entry struct {
+				Type    string          `json:"type"`
+				Payload json.RawMessage `json:"payload"`
+			}
+			if err := json.Unmarshal(line, &entry); err != nil {
+				return err
+			}
+			if entry.Type == "session_meta" {
+				var meta struct {
+					Source         json.RawMessage `json:"source"`
+					ThreadSource   string          `json:"thread_source"`
+					ParentThreadID string          `json:"parent_thread_id"`
+				}
+				if err := json.Unmarshal(entry.Payload, &meta); err != nil {
+					return err
+				}
+				var source struct {
+					Subagent json.RawMessage `json:"subagent"`
+				}
+				raw := strings.TrimSpace(string(meta.Source))
+				if strings.HasPrefix(raw, "{") {
+					if err := json.Unmarshal(meta.Source, &source); err != nil {
+						return err
+					}
+				}
+				if len(source.Subagent) > 0 && string(source.Subagent) != "null" {
+					out.ParentHarnessSessionID = meta.ParentThreadID
+					if out.Source == "" {
+						out.Source = msg.PurposeSubagent
+					}
+				} else if meta.ThreadSource == "user" && out.Source == "" {
+					out.Source = msg.PurposeChat
+				}
+				return nil
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
 }
