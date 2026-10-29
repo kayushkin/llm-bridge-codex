@@ -21,9 +21,13 @@ const harness = msg.HarnessCodex
 type Translator struct {
 	mu        sync.Mutex
 	sessionID string // harness session ID (thread ID once known, bridge ID before)
-	bridgeID  string // server-assigned bridge_id (stable PK)
-	clientID  string // frontend correlation key (passed through unchanged)
-	emit      func(msg.Event)
+	// threadID is this session's own Codex thread, empty until SetSessionID
+	// names it. Notifications for any other thread are dropped: see
+	// onThisThread.
+	threadID string
+	bridgeID string // server-assigned bridge_id (stable PK)
+	clientID string // frontend correlation key (passed through unchanged)
+	emit     func(msg.Event)
 
 	// bridgeServerURL is bridge-server's base URL (no trailing slash).
 	// Used by approval-request handlers to proxy gating decisions through
@@ -42,6 +46,10 @@ type Translator struct {
 	completedTools map[string]struct{}         // item IDs already emitted as tool_result
 	toolNames      map[string]string           // item ID → canonical name used by tool_call
 	toolOutput     map[string]*strings.Builder // item ID → output deltas retained until completion
+	// subagentActivities holds the subAgentActivity item IDs already
+	// reported. Codex sends each such item twice, on item/started and on
+	// item/completed, with the same contents.
+	subagentActivities map[string]struct{}
 }
 
 // SetBridgeServerURL configures where approval-request handlers POST
@@ -67,6 +75,8 @@ func NewTranslator(sessionID, clientID string, emit func(msg.Event)) *Translator
 		completedTools: make(map[string]struct{}),
 		toolNames:      make(map[string]string),
 		toolOutput:     make(map[string]*strings.Builder),
+
+		subagentActivities: make(map[string]struct{}),
 	}
 }
 
@@ -76,6 +86,91 @@ func (t *Translator) SetSessionID(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.sessionID = id
+	t.threadID = id
+}
+
+// onThisThread registers h for a notification method, and drops each
+// notification that names a thread other than this session's own.
+//
+// Codex sends a spawned subagent's notifications over its parent's
+// connection: measured on codex-cli 0.165.0, the child thread's turn/started,
+// agentMessage items, thread/status/changed and turn/completed all arrived
+// there, each with the child's threadId. Passed on, they read as the parent's
+// own: the child's answer became the parent's text and the child's
+// turn/completed became a result that ended the parent's turn while it was
+// still waiting on the child. The parent learns of the child from its own
+// subAgentActivity items (subagentActivityEvent), and the child's work is in
+// its own rollout file, which discovery reads into the child's session.
+//
+// A notification that names no thread, and every notification before
+// SetSessionID names this session's thread, passes through.
+func (t *Translator) onThisThread(srv *AppServer, method string, h NotificationHandler) {
+	srv.OnNotification(method, func(m string, params json.RawMessage) {
+		var named struct {
+			ThreadID string `json:"threadId"`
+		}
+		// A body that does not decode is left to the handler, which reports
+		// it or not as it always has.
+		if json.Unmarshal(params, &named) == nil && named.ThreadID != "" {
+			t.mu.Lock()
+			own := t.threadID
+			t.mu.Unlock()
+			if own != "" && named.ThreadID != own {
+				return
+			}
+		}
+		h(m, params)
+	})
+}
+
+// subagentActivityEvent turns a subAgentActivity item into the task frame
+// Claude Code sends for the same moment, so llm-bridge-server promotes the
+// subagent to a session of its own and lists it among the parent's running
+// subagents. It returns false for an item that is not a subAgentActivity, or
+// one already reported.
+//
+// Codex reports a subagent's life on the parent's thread as these items
+// (codex-cli 0.165.0, app-server schema SubAgentActivityThreadItem): kind
+// "started" when spawn_agent starts it, "interacted" when the parent sends it
+// more work, "completed" when it finishes, and "interrupted" when the parent
+// closes or interrupts it. The task id is the child's thread id, which every
+// one of them names, and that id is also the child's own session id.
+func (t *Translator) subagentActivityEvent(item CodexItem) (msg.Event, bool) {
+	if item.Type != "subAgentActivity" || item.ID == "" || item.AgentThreadID == "" {
+		return msg.Event{}, false
+	}
+	t.mu.Lock()
+	_, seen := t.subagentActivities[item.ID]
+	t.subagentActivities[item.ID] = struct{}{}
+	t.mu.Unlock()
+	if seen {
+		return msg.Event{}, false
+	}
+
+	e := t.event(msg.EventSystem)
+	switch item.Kind {
+	case "started", "interacted":
+		e.System = &msg.SystemEvent{
+			Subtype:                  "task_started",
+			TaskID:                   item.AgentThreadID,
+			ToolUseID:                item.ID,
+			TaskType:                 msg.TaskTypeLocalAgent,
+			Description:              item.AgentPath,
+			SubagentHarnessSessionID: item.AgentThreadID,
+		}
+	case "completed":
+		e.System = &msg.SystemEvent{
+			Subtype: "task_notification", TaskID: item.AgentThreadID, TaskStatus: msg.TaskStatusCompleted,
+		}
+	case "interrupted":
+		e.System = &msg.SystemEvent{
+			Subtype: "task_notification", TaskID: item.AgentThreadID, TaskStatus: msg.TaskStatusCancelled,
+		}
+	default:
+		log.Printf("[codex] subAgentActivity kind %q for thread %s is not one this build knows; no task frame sent", item.Kind, item.AgentThreadID)
+		return msg.Event{}, false
+	}
+	return e, true
 }
 
 func (t *Translator) event(typ msg.EventType) msg.Event {
@@ -158,6 +253,7 @@ func (t *Translator) resetTurn(threadID string) {
 	t.completedTools = make(map[string]struct{})
 	t.toolNames = make(map[string]string)
 	t.toolOutput = make(map[string]*strings.Builder)
+	t.subagentActivities = make(map[string]struct{})
 }
 
 // emitToolCallOnce accepts both Codex notification dialects. Current app-server
@@ -422,7 +518,7 @@ func (t *Translator) toolCallCount(threadID string) int {
 // RegisterHandlers wires up all Codex notification→event translations.
 func (t *Translator) RegisterHandlers(srv *AppServer) {
 	// --- Thread lifecycle ---
-	srv.OnNotification("thread/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "thread/started", func(_ string, params json.RawMessage) {
 		var n ThreadStartedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -439,7 +535,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		// EventSessionState emission here.
 	})
 
-	srv.OnNotification("thread/status/changed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "thread/status/changed", func(_ string, params json.RawMessage) {
 		var n ThreadStatusChangedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -451,7 +547,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Turn lifecycle ---
-	srv.OnNotification("turn/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "turn/started", func(_ string, params json.RawMessage) {
 		var n TurnStartedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -462,7 +558,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// Token usage is reported separately before turn/completed.
-	srv.OnNotification("thread/tokenUsage/updated", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "thread/tokenUsage/updated", func(_ string, params json.RawMessage) {
 		var n TokenUsageNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -476,7 +572,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		}, n.TokenUsage.ModelContextWindow)
 	})
 
-	srv.OnNotification("turn/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "turn/completed", func(_ string, params json.RawMessage) {
 		var n TurnCompletedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -506,7 +602,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.resetTurn(n.ThreadID)
 	})
 
-	srv.OnNotification("turn/failed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "turn/failed", func(_ string, params json.RawMessage) {
 		var n TurnFailedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -525,7 +621,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Generic item lifecycle (provides metadata for all item types) ---
-	srv.OnNotification("item/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/started", func(_ string, params json.RawMessage) {
 		var n ItemNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -540,6 +636,10 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if name, input, ok := itemToolCall(n.Item); ok {
 			t.emitToolCallOnce(n.ThreadID, n.Item.ID, name, input, params)
 		}
+		if e, ok := t.subagentActivityEvent(n.Item); ok {
+			e.Raw = params
+			t.emit(e)
+		}
 
 		// Emit system event for item start (useful for debugging/observability).
 		e := t.event(msg.EventSystem)
@@ -551,7 +651,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emit(e)
 	})
 
-	srv.OnNotification("item/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/completed", func(_ string, params json.RawMessage) {
 		var n ItemNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -571,10 +671,14 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		if name, output, isError, ok := itemToolResult(n.Item, streamedOutput); ok {
 			t.emitToolResultOnce(n.Item.ID, name, output, isError, params)
 		}
+		if e, ok := t.subagentActivityEvent(n.Item); ok {
+			e.Raw = params
+			t.emit(e)
+		}
 	})
 
 	// --- Agent message (text streaming) ---
-	srv.OnNotification("item/agentMessage/delta", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/agentMessage/delta", func(_ string, params json.RawMessage) {
 		var n AgentMessageDeltaNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -604,12 +708,12 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emit(e)
 	})
 
-	srv.OnNotification("item/agentMessage/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/agentMessage/completed", func(_ string, params json.RawMessage) {
 		// Full text already accumulated from deltas — no event needed.
 	})
 
 	// --- Reasoning / thinking ---
-	srv.OnNotification("item/reasoning/textDelta", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/reasoning/textDelta", func(_ string, params json.RawMessage) {
 		var n ReasoningTextDeltaNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -620,7 +724,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emit(e)
 	})
 
-	srv.OnNotification("item/reasoning/summaryTextDelta", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/reasoning/summaryTextDelta", func(_ string, params json.RawMessage) {
 		var n ReasoningSummaryTextDeltaNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -632,7 +736,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Command execution ---
-	srv.OnNotification("item/commandExecution/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/commandExecution/started", func(_ string, params json.RawMessage) {
 		var n CommandExecutionStartedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -641,7 +745,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emitToolCallOnce(n.ThreadID, n.ItemID, "command_execution", input, params)
 	})
 
-	srv.OnNotification("item/commandExecution/outputDelta", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/commandExecution/outputDelta", func(_ string, params json.RawMessage) {
 		var n CommandExecutionOutputDeltaNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -652,7 +756,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.appendToolOutput(n.ItemID, n.Delta)
 	})
 
-	srv.OnNotification("item/commandExecution/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/commandExecution/completed", func(_ string, params json.RawMessage) {
 		var n CommandExecutionCompletedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -666,7 +770,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- File changes ---
-	srv.OnNotification("item/fileChange/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/fileChange/started", func(_ string, params json.RawMessage) {
 		var n FileChangeStartedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -675,7 +779,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emitToolCallOnce(n.ThreadID, n.ItemID, "file_change", input, params)
 	})
 
-	srv.OnNotification("item/fileChange/outputDelta", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/fileChange/outputDelta", func(_ string, params json.RawMessage) {
 		var n FileChangeOutputDeltaNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -683,7 +787,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.appendToolOutput(n.ItemID, n.Delta)
 	})
 
-	srv.OnNotification("item/fileChange/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/fileChange/completed", func(_ string, params json.RawMessage) {
 		var n FileChangeCompletedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -696,7 +800,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- MCP tool calls ---
-	srv.OnNotification("item/mcpToolCall/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/mcpToolCall/started", func(_ string, params json.RawMessage) {
 		var n MCPToolCallStartedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -704,7 +808,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emitToolCallOnce(n.ThreadID, n.ItemID, n.ToolName, json.RawMessage(n.Arguments), params)
 	})
 
-	srv.OnNotification("item/mcpToolCall/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/mcpToolCall/completed", func(_ string, params json.RawMessage) {
 		var n MCPToolCallCompletedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -713,7 +817,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Collab tool calls ---
-	srv.OnNotification("item/collabToolCall/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/collabToolCall/started", func(_ string, params json.RawMessage) {
 		var n CollabToolCallStartedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -721,7 +825,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emitToolCallOnce(n.ThreadID, n.ItemID, n.ToolName, json.RawMessage(n.Arguments), params)
 	})
 
-	srv.OnNotification("item/collabToolCall/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/collabToolCall/completed", func(_ string, params json.RawMessage) {
 		var n CollabToolCallCompletedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -730,7 +834,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Web search ---
-	srv.OnNotification("item/webSearch/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/webSearch/started", func(_ string, params json.RawMessage) {
 		var n WebSearchStartedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -739,7 +843,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 		t.emitToolCallOnce(n.ThreadID, n.ItemID, "web_search", input, params)
 	})
 
-	srv.OnNotification("item/webSearch/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/webSearch/completed", func(_ string, params json.RawMessage) {
 		var n WebSearchCompletedNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -748,7 +852,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Plan ---
-	srv.OnNotification("item/plan/delta", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/plan/delta", func(_ string, params json.RawMessage) {
 		var n PlanDeltaNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -760,7 +864,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Item errors ---
-	srv.OnNotification("item/error", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/error", func(_ string, params json.RawMessage) {
 		var n ItemErrorNotification
 		if err := json.Unmarshal(params, &n); err != nil {
 			return
@@ -772,7 +876,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Top-level error ---
-	srv.OnNotification("error", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "error", func(_ string, params json.RawMessage) {
 		var n struct {
 			Message string `json:"message"`
 			Code    string `json:"code,omitempty"`
@@ -797,23 +901,23 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	// same way it treats a Claude Code one. Filing them as EventSystem with a
 	// subtype string reached the client as opaque text, so nothing downstream
 	// could tell which hook ran, against which tool, or whether it blocked.
-	srv.OnNotification("hook/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "hook/started", func(_ string, params json.RawMessage) {
 		t.emit(hookEvent(t, params, "started"))
 	})
 
-	srv.OnNotification("hook/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "hook/completed", func(_ string, params json.RawMessage) {
 		t.emit(hookEvent(t, params, "completed"))
 	})
 
 	// --- Turn diff/plan updates ---
-	srv.OnNotification("turn/diff/updated", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "turn/diff/updated", func(_ string, params json.RawMessage) {
 		e := t.event(msg.EventSystem)
 		e.System = &msg.SystemEvent{Subtype: "turn_diff_updated"}
 		e.Raw = params
 		t.emit(e)
 	})
 
-	srv.OnNotification("turn/plan/updated", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "turn/plan/updated", func(_ string, params json.RawMessage) {
 		var n struct {
 			Plan string `json:"plan,omitempty"`
 		}
@@ -827,7 +931,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Thread compaction completed ---
-	srv.OnNotification("thread/compacted", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "thread/compacted", func(_ string, params json.RawMessage) {
 		e := t.event(msg.EventSystem)
 		e.System = &msg.SystemEvent{Subtype: "thread_compacted"}
 		e.Raw = params
@@ -835,7 +939,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Model rerouted ---
-	srv.OnNotification("model/rerouted", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "model/rerouted", func(_ string, params json.RawMessage) {
 		var n struct {
 			Model string `json:"model,omitempty"`
 		}
@@ -852,14 +956,14 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Auto-approval review ---
-	srv.OnNotification("item/autoApprovalReview/started", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/autoApprovalReview/started", func(_ string, params json.RawMessage) {
 		e := t.event(msg.EventSystem)
 		e.System = &msg.SystemEvent{Subtype: "auto_approval_review_started"}
 		e.Raw = params
 		t.emit(e)
 	})
 
-	srv.OnNotification("item/autoApprovalReview/completed", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/autoApprovalReview/completed", func(_ string, params json.RawMessage) {
 		e := t.event(msg.EventSystem)
 		e.System = &msg.SystemEvent{Subtype: "auto_approval_review_completed"}
 		e.Raw = params
@@ -867,7 +971,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- MCP tool call progress ---
-	srv.OnNotification("item/mcpToolCall/progress", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/mcpToolCall/progress", func(_ string, params json.RawMessage) {
 		e := t.event(msg.EventSystem)
 		e.System = &msg.SystemEvent{Subtype: "mcp_tool_call_progress"}
 		e.Raw = params
@@ -875,7 +979,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Reasoning summary part added ---
-	srv.OnNotification("item/reasoning/summaryPartAdded", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/reasoning/summaryPartAdded", func(_ string, params json.RawMessage) {
 		e := t.event(msg.EventSystem)
 		e.System = &msg.SystemEvent{Subtype: "reasoning_summary_part_added"}
 		e.Raw = params
@@ -883,7 +987,7 @@ func (t *Translator) RegisterHandlers(srv *AppServer) {
 	})
 
 	// --- Command execution terminal interaction ---
-	srv.OnNotification("item/commandExecution/terminalInteraction", func(_ string, params json.RawMessage) {
+	t.onThisThread(srv, "item/commandExecution/terminalInteraction", func(_ string, params json.RawMessage) {
 		e := t.event(msg.EventSystem)
 		e.System = &msg.SystemEvent{Subtype: "terminal_interaction"}
 		e.Raw = params

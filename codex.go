@@ -314,6 +314,9 @@ type CodexItem struct {
 	Model                 *string         `json:"model,omitempty"`
 	ReasoningEffort       *string         `json:"reasoningEffort,omitempty"`
 	AgentsStates          json.RawMessage `json:"agentsStates,omitempty"`
+	AgentThreadID         string          `json:"agentThreadId,omitempty"`
+	AgentPath             string          `json:"agentPath,omitempty"`
+	Kind                  string          `json:"kind,omitempty"`
 	Query                 string          `json:"query,omitempty"`
 	Action                json.RawMessage `json:"action,omitempty"`
 	Results               json.RawMessage `json:"results,omitempty"`
