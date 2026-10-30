@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
@@ -23,6 +24,7 @@ type Bridge struct {
 	clientID string // frontend correlation key
 	threadID string // current Codex thread ID — the harness_session_id; rotates on resume/fork
 	turnDone chan struct{}
+	emit     func(msg.Event)
 }
 
 func NewBridge(cfg Config, emit func(msg.Event)) *Bridge {
@@ -64,6 +66,7 @@ func (b *Bridge) event(typ msg.EventType) msg.Event {
 func (b *Bridge) Init(ctx context.Context, sessionID, clientID string, emit func(msg.Event)) error {
 	b.bridgeID = sessionID
 	b.clientID = clientID
+	b.emit = emit
 	b.trans = NewTranslator(sessionID, clientID, emit)
 	b.trans.SetBridgeServerURL(b.cfg.BridgeServerURL)
 
@@ -644,6 +647,12 @@ func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) err
 	seq := b.nextSequence()
 	newID, err := b.recordChain("resume", parent, seq, func() (string, error) {
 		result, err := b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: parent})
+		if err != nil && strings.Contains(err.Error(), codexActiveWriterRefusal) {
+			if releaseErr := b.closeCodexTerminalHoldingThread(parent); releaseErr != nil {
+				return "", fmt.Errorf("thread/resume: %w; and could not close the codex holding it: %v", err, releaseErr)
+			}
+			result, err = b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: parent})
+		}
 		if err != nil {
 			return "", fmt.Errorf("thread/resume: %w", err)
 		}
@@ -666,6 +675,32 @@ func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) err
 		return nil
 	}
 	return b.startTurn(ctx, params.Prompt)
+}
+
+// closeCodexTerminalHoldingThread stops the codex terminal that has the thread
+// open, so this session can resume it, and says so in the session's chat. A
+// codex terminal hands its threads to codex's shared background app-server,
+// which keeps the thread's writer lock while the terminal runs; codex then
+// refuses this session's resume with "already has an active writer".
+func (b *Bridge) closeCodexTerminalHoldingThread(threadID string) error {
+	codexHome, err := codexHomeDirectory()
+	if err != nil {
+		return err
+	}
+	stopped, err := releaseThreadWriterLock(procProcessTable{}, threadWriterLockPath(codexHome, threadID), os.Getpid(), 10*time.Second)
+	if err != nil {
+		return err
+	}
+	names := make([]string, len(stopped))
+	for index, process := range stopped {
+		names[index] = process.String()
+	}
+	notice := fmt.Sprintf("A codex terminal on this machine had this conversation open, so codex would not let the session continue it. Closed it: %s.", strings.Join(names, "; "))
+	log.Printf("[bridge] %s", notice)
+	event := b.event(msg.EventSystem)
+	event.System = &msg.SystemEvent{Subtype: "codex_terminal_closed", Message: notice}
+	b.emit(event)
+	return nil
 }
 
 // HandleCompact triggers context compaction on the thread.
