@@ -22,6 +22,9 @@ func TestProcProcessTableFindsTheProcessHoldingAFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { holder.Process.Kill(); holder.Wait() })
+	// The shell opens the file before it execs sleep, so the file is held
+	// by the shell for a moment first: wait for both, the file held and the
+	// process turned into sleep.
 	table := procProcessTable{}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -30,18 +33,20 @@ func TestProcProcessTableFindsTheProcessHoldingAFile(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(holders) == 1 && holders[0] == holder.Process.Pid {
-			break
+			process, err := table.process(holder.Process.Pid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(process.arguments) > 0 && filepath.Base(process.arguments[0]) == "sleep" {
+				if process.parentPID != os.Getpid() {
+					t.Fatalf("process = %+v, want sleep under pid %d", process, os.Getpid())
+				}
+				return
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("holdersOf = %v, want [%d]", holders, holder.Process.Pid)
+			t.Fatalf("holdersOf = %v, want [%d] running sleep", holders, holder.Process.Pid)
 		}
 		time.Sleep(50 * time.Millisecond)
-	}
-	process, err := table.process(holder.Process.Pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if process.parentPID != os.Getpid() || filepath.Base(process.arguments[0]) != "sleep" {
-		t.Fatalf("process = %+v, want sleep under pid %d", process, os.Getpid())
 	}
 }
