@@ -63,7 +63,7 @@ func TestSubagentActivityBecomesTaskFramesAndChildThreadStaysOut(t *testing.T) {
 		t.Errorf("got %d result events, want 1: the child's turn/completed must not end the parent's turn", results)
 	}
 	if len(tasks) != 3 {
-		t.Fatalf("got %d task frames, want 3 (started, completed, cancelled): %+v", len(tasks), tasks)
+		t.Fatalf("got %d task frames, want 3 (started, completed, canceled): %+v", len(tasks), tasks)
 	}
 	started := tasks[0]
 	if started.Subtype != "task_started" || started.TaskID != childThread || started.ToolUseID != "call_spawn" ||
@@ -78,7 +78,7 @@ func TestSubagentActivityBecomesTaskFramesAndChildThreadStaysOut(t *testing.T) {
 		t.Errorf("second task frame = %+v, want task_notification completed", tasks[1])
 	}
 	if tasks[2].TaskStatus != msg.TaskStatusCancelled {
-		t.Errorf("third task frame = %+v, want task_notification cancelled", tasks[2])
+		t.Errorf("third task frame = %+v, want task_notification canceled", tasks[2])
 	}
 }
 

@@ -6,7 +6,7 @@ import (
 )
 
 // The real thing, as Codex writes it. Every case below is measured against
-// this so a stricter parse cannot quietly stop recognising a live filename.
+// this so a stricter parse cannot quietly stop recognizing a live filename.
 const realRolloutName = "rollout-2026-04-13T02-00-13-019d8491-627f-79e1-89a7-d32ed21ee93e.jsonl"
 const realRolloutID = "019d8491-627f-79e1-89a7-d32ed21ee93e"
 
@@ -83,7 +83,7 @@ func TestExtractIDFromFilename_RefusesACandidateThatIsNotAUUID(t *testing.T) {
 }
 
 // TestExtractIDFromFilename_AcceptsARealRolloutName is the known-negative
-// control. A stricter parse that also stops recognising live Codex filenames
+// control. A stricter parse that also stops recognizing live Codex filenames
 // would pass the test above and break discovery, so this must be seen to pass
 // both before and after the repair.
 func TestExtractIDFromFilename_AcceptsARealRolloutName(t *testing.T) {

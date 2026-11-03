@@ -385,7 +385,7 @@ func TestUnconfiguredBridgeURLAutoApprovesWithoutConsultingAnyRule(t *testing.T)
 
 	resp := decodeApprovalResponse(t, raw)
 	if resp["approved"] != true {
-		t.Errorf("an unset bridgeServerURL must auto-approve (legacy behaviour); got %#v", resp)
+		t.Errorf("an unset bridgeServerURL must auto-approve (legacy behavior); got %#v", resp)
 	}
 	if got.method != "" {
 		t.Errorf("the unconfigured fallback consulted the prehook at %s %q; it must not make the call at all",
@@ -599,12 +599,12 @@ func TestTypedApprovalHandlersRefuseAMalformedPayload(t *testing.T) {
 }
 
 // TestExecCommandApprovalGatesOnAnEmptyCommandWhenItsPayloadIsMalformed pins the
-// behaviour of the one handler that does NOT refuse.
+// behavior of the one handler that does NOT refuse.
 //
 //	_ = json.Unmarshal(params, &req)
 //
 // The error is discarded, so a payload codex could not encode gates on an empty
-// command instead of failing. This test asserts the behaviour that ships rather
+// command instead of failing. This test asserts the behavior that ships rather
 // than the one that might be preferred — an empty command reaching the rule
 // engine is a real event, and a rule that allows an empty string would let it
 // through. Pinning it is what makes changing it a decision rather than an
@@ -666,19 +666,19 @@ func TestHeadlessHandlersRefuseWhatNoOneCanAnswer(t *testing.T) {
 	}
 }
 
-// TestElicitationIsCancelledRatherThanRefused covers the fourth, and it is the
+// TestElicitationIsCanceledRatherThanRefused covers the fourth, and it is the
 // odd one out on purpose: an MCP elicitation is answered with a successful
 // "cancel" action, not an RPC error.
 //
 // Nothing else distinguishes the two shapes. A handler rewritten to refuse this
 // one the way the three above are refused would compile, and the MCP server would
 // see a protocol error where it expected a user declining.
-func TestElicitationIsCancelledRatherThanRefused(t *testing.T) {
+func TestElicitationIsCanceledRatherThanRefused(t *testing.T) {
 	f := newApprovalFixture(t, "http://unused.invalid")
 
 	raw, err := f.call(t, "mcpServer/elicitation/request", `{"message":"pick one"}`)
 	if err != nil {
-		t.Fatalf("an elicitation must be cancelled, not refused with an error: %v", err)
+		t.Fatalf("an elicitation must be canceled, not refused with an error: %v", err)
 	}
 	var got map[string]any
 	if err := json.Unmarshal(raw, &got); err != nil {

@@ -22,7 +22,7 @@ package main
 //     (which sets danger-full-access) and execpolicy rules out of the call;
 //     auth still comes from CODEX_HOME. --ephemeral writes no session file.
 //   - The system prompt goes in as developer_instructions: exec has no flag
-//     for it, and the key is honoured.
+//     for it, and the key is honored.
 //   - --output-schema is sent to OpenAI as a strict response format, which
 //     refuses a schema unless every object sets additionalProperties:false and
 //     lists every property as required. strictSchema rewrites the caller's
@@ -30,7 +30,7 @@ package main
 //     dropNullOptionals removes those nulls from the answer, so the caller
 //     receives the shape it asked for.
 //   - There is no setting that caps output tokens (model_max_output_tokens is
-//     ignored as unrecognised), so MaxTokens cannot be honoured here. A reply
+//     ignored as unrecognized), so MaxTokens cannot be honored here. A reply
 //     is still validated as exactly one JSON object.
 //   - Usage arrives on the turn.completed event. input_tokens includes the
 //     cached ones and output_tokens includes the reasoning ones; they are split

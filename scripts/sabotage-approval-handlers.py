@@ -2,7 +2,7 @@
 
 This is a THIRD scorer next to sabotage-truncation.py and sabotage-prehook-contract.py,
 and the split follows the same rule those two established: a scorer is named for
-the thing it scores, and widening one to cover a neighbouring frame makes its name
+the thing it scores, and widening one to cover a neighboring frame makes its name
 lie about what a green run means.
 
     sabotage-truncation.py          the rune-boundary cut and its two budgets
@@ -286,7 +286,7 @@ TEST_NAMES = (
     "TestTypedApprovalHandlersRefuseAMalformedPayload",
     "TestExecCommandApprovalGatesOnAnEmptyCommandWhenItsPayloadIsMalformed",
     "TestHeadlessHandlersRefuseWhatNoOneCanAnswer",
-    "TestElicitationIsCancelledRatherThanRefused",
+    "TestElicitationIsCanceledRatherThanRefused",
 )
 
 # The whole package, no -run filter. See the module docstring.

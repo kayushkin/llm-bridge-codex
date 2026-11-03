@@ -214,7 +214,7 @@ func TestPrehookAcceptsTheWholeTwoHundredFamily(t *testing.T) {
 
 	approved, reason := gateWithContractArgs(srv.URL)
 	if !approved {
-		t.Fatalf("HTTP 202 is a success and its allow decision must be honoured; got denied (%q)", reason)
+		t.Fatalf("HTTP 202 is a success and its allow decision must be honored; got denied (%q)", reason)
 	}
 }
 

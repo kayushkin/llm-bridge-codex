@@ -30,7 +30,7 @@ import (
 // 80->79, 80->81) read UNNOTICED, as did dropping either cut entirely.
 //
 // Both budgets are log lines rather than stored data, which is why this cut
-// outlived the one in discover.go and why the card filing it labelled itself
+// outlived the one in discover.go and why the card filing it labeled itself
 // lower-tier. A drifted budget here costs a slightly shorter log message and
 // nothing more.
 const (

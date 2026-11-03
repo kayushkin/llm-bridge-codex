@@ -13,7 +13,7 @@ import (
 // segment on the wire.
 //
 // Why it matters here specifically: the gate is fail-closed, so an id that
-// slides into a neighbouring route does not open a hole — it denies. What it
+// slides into a neighboring route does not open a hole — it denies. What it
 // does instead is make a denial ambiguous, because "the rule engine said no"
 // and "the request never reached the rule engine" arrive as the same non-2xx.
 // Escaping keeps the request addressed at the engine.

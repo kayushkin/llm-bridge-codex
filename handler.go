@@ -359,7 +359,7 @@ func (b *Bridge) nextSequence() int {
 // single-source signal from bridge-server; nothing on the per-session level
 // should be able to override the user's mode choice silently.
 //
-// It fails on a disabled_tools name codex cannot honour, before anything is
+// It fails on a disabled_tools name codex cannot honor, before anything is
 // spawned or recorded.
 func (b *Bridge) applyStartConfig(params StartParams) error {
 	if _, err := appServerArgsDisablingTools(params.DisabledTools); err != nil {
