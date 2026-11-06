@@ -40,6 +40,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,13 +88,6 @@ func runOneShot() int {
 	}
 	if request.Prompt == "" {
 		writeOneShotError("prompt required")
-		return 1
-	}
-	if len(request.Images) > 0 {
-		// codex exec takes images only as files on its command line, which
-		// this mode does not write; refusing lets a router try a model that
-		// can see, where answering would describe a picture it never saw.
-		writeOneShotError("this harness's oneshot mode does not send images; use a model on a harness that does")
 		return 1
 	}
 	if id := os.Getenv("LLMBRIDGE_CREDENTIAL_ID"); id != "" {
@@ -165,6 +159,17 @@ func runOneShot() int {
 		schemaFile.Close()
 		args = append(args, "--output-schema", schemaFile.Name())
 	}
+	// codex exec takes images only as files on its command line, so each
+	// one is written to the working directory for the call and removed after.
+	for index, image := range request.Images {
+		path, err := writeOneShotImage(workDir, index, image)
+		if err != nil {
+			writeOneShotError(err.Error())
+			return 1
+		}
+		defer os.Remove(path)
+		args = append(args, "-i", path)
+	}
 	args = append(args, "-")
 
 	ctx, cancel := context.WithTimeout(context.Background(), oneShotTimeout)
@@ -213,6 +218,37 @@ func runOneShot() int {
 	}
 	json.NewEncoder(os.Stdout).Encode(response)
 	return 0
+}
+
+// oneShotImageExtensions maps the media types a oneshot image may carry to the
+// file extension codex reads the image type from.
+var oneShotImageExtensions = map[string]string{"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
+
+// writeOneShotImage decodes one request image into a file in directory and
+// returns its path.
+func writeOneShotImage(directory string, index int, image msg.OneShotImage) (string, error) {
+	extension, known := oneShotImageExtensions[image.MediaType]
+	if !known {
+		return "", fmt.Errorf("image %d: media type %q is not one codex reads", index, image.MediaType)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(image.DataBase64)
+	if err != nil {
+		return "", fmt.Errorf("image %d: data_base64: %w", index, err)
+	}
+	file, err := os.CreateTemp(directory, fmt.Sprintf("image-%d-*%s", index, extension))
+	if err != nil {
+		return "", fmt.Errorf("write image %d: %w", index, err)
+	}
+	if _, err := file.Write(decoded); err != nil {
+		file.Close()
+		os.Remove(file.Name())
+		return "", fmt.Errorf("write image %d: %w", index, err)
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(file.Name())
+		return "", fmt.Errorf("write image %d: %w", index, err)
+	}
+	return file.Name(), nil
 }
 
 // execResult is what a codex exec --json run said.

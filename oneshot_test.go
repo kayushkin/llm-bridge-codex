@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -164,18 +165,63 @@ func TestOneShotRefusesAnAPIKeyAndAMissingModel(t *testing.T) {
 	}
 }
 
-func TestAOneShotWithImagesIsRefusedNotAnsweredBlind(t *testing.T) {
+func TestAOneShotSendsEachImageToCodexAsAFile(t *testing.T) {
 	directory := t.TempDir()
+	fake := filepath.Join(directory, "codex")
+	// The fake copies each -i file before the wrapper removes it.
+	script := "#!/bin/sh\nn=0\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -i ]; then cp \"$2\" \"$FAKE_CODEX_RECORD.image$n\"; echo \"$2\" >> \"$FAKE_CODEX_RECORD.paths\"; n=$((n+1)); fi; shift; done\ncat > /dev/null\n" +
+		"echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"a cat\"}}'\necho '{\"type\":\"turn.completed\",\"usage\":{}}'\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	binary := filepath.Join(directory, "llm-bridge-codex")
 	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, output)
 	}
-	request, _ := json.Marshal(msg.OneShotRequest{Prompt: "who is this?", Images: []msg.OneShotImage{{MediaType: "image/png", DataBase64: "AAEC"}}})
+	record := filepath.Join(directory, "record")
+	request, _ := json.Marshal(msg.OneShotRequest{Prompt: "what is this?", Model: "gpt-6-astra", Images: []msg.OneShotImage{
+		{MediaType: "image/jpeg", DataBase64: "AAEC"}, {MediaType: "image/png", DataBase64: "AwQF"}}})
 	command := exec.Command(binary, "-oneshot")
 	command.Stdin = strings.NewReader(string(request))
-	command.Env = []string{"HOME=" + directory, "PATH=" + os.Getenv("PATH")}
+	command.Env = []string{"HOME=" + directory, "PATH=" + os.Getenv("PATH"), "CODEX_PATH=" + fake, "FAKE_CODEX_RECORD=" + record}
 	output, err := command.Output()
-	if err == nil || !strings.Contains(string(output), "does not send images") {
-		t.Errorf("a request with images answered %v %s, want a refusal", err, output)
+	if err != nil {
+		t.Fatalf("oneshot: %v\n%s", err, output)
+	}
+	for index, want := range []string{"\x00\x01\x02", "\x03\x04\x05"} {
+		got, err := os.ReadFile(fmt.Sprintf("%s.image%d", record, index))
+		if err != nil || string(got) != want {
+			t.Errorf("image %d reached codex as %q (%v), want %q", index, got, err, want)
+		}
+	}
+	paths, _ := os.ReadFile(record + ".paths")
+	lines := strings.Fields(string(paths))
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], ".jpg") || !strings.HasSuffix(lines[1], ".png") {
+		t.Errorf("image paths %q, want a .jpg then a .png", lines)
+	}
+	for _, path := range lines {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("image file %s was left behind", path)
+		}
+	}
+}
+
+func TestAOneShotImageOfAnUnknownTypeIsRefused(t *testing.T) {
+	directory := t.TempDir()
+	fake := filepath.Join(directory, "codex")
+	if err := os.WriteFile(fake, []byte(fakeCodex), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(directory, "llm-bridge-codex")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	request, _ := json.Marshal(msg.OneShotRequest{Prompt: "who is this?", Model: "gpt-6-astra", Images: []msg.OneShotImage{{MediaType: "image/tiff", DataBase64: "AAEC"}}})
+	command := exec.Command(binary, "-oneshot")
+	command.Stdin = strings.NewReader(string(request))
+	command.Env = []string{"HOME=" + directory, "PATH=" + os.Getenv("PATH"), "CODEX_PATH=" + fake, "FAKE_CODEX_RECORD=" + filepath.Join(directory, "record")}
+	output, err := command.Output()
+	if err == nil || !strings.Contains(string(output), "not one codex reads") {
+		t.Errorf("a tiff answered %v %s, want a refusal", err, output)
 	}
 }
