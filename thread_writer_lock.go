@@ -22,6 +22,11 @@ func threadWriterLockPath(codexHome, threadID string) string {
 	return filepath.Join(codexHome, "thread-writer-locks", threadID+".lock")
 }
 
+// bridgeSessionIDEnvironmentVariable is the variable llm-bridge-server sets on
+// every wrapper it starts to the session's bridge id (br_…). It is how the lock
+// release tells a wrapper of this same session from one of another session.
+const bridgeSessionIDEnvironmentVariable = "LLM_BRIDGE_SESSION_ID"
+
 // codexProcess is one process as the lock release sees it.
 type codexProcess struct {
 	pid       int
@@ -59,6 +64,9 @@ func (p codexProcess) isBridgeWrapper() bool {
 type processTable interface {
 	holdersOf(path string) ([]int, error)
 	process(pid int) (codexProcess, error)
+	// environmentValue reads one variable from a process's environment, and
+	// reports whether the process has it set.
+	environmentValue(pid int, name string) (string, bool, error)
 	signal(pid int, signal syscall.Signal) error
 }
 
@@ -70,13 +78,20 @@ type processTable interface {
 // only that server would leave the terminal running, and the terminal would
 // start a new one and take the thread back, so the release also stops every
 // codex process above the holder: the server's supervisor and the terminal
-// itself. It stops nothing that runs under an llm-bridge-codex wrapper, since
-// that codex belongs to another bridge session, and nothing in this process's
-// own tree; either one is an error naming the holder.
+// itself. It stops nothing in this process's own tree, and nothing under an
+// llm-bridge-codex wrapper of another bridge session; either one is an error
+// naming the holder.
+//
+// A wrapper whose LLM_BRIDGE_SESSION_ID is ownBridgeSessionID is a leftover of
+// this same session: when llm-bridge-server is stopped, the wrapper it started
+// runs on in its own process group with its codex app-server still writing the
+// thread, and the server's new wrapper for the session then cannot resume it.
+// The server runs one wrapper per session, so that leftover is stale: the
+// release stops it with the codex under it.
 //
 // It sends SIGTERM top-down, waits for the lock to be free, then sends SIGKILL
 // to what is left. It returns the processes it stopped.
-func releaseThreadWriterLock(table processTable, lockPath string, ownPID int, wait time.Duration) ([]codexProcess, error) {
+func releaseThreadWriterLock(table processTable, lockPath string, ownPID int, ownBridgeSessionID string, wait time.Duration) ([]codexProcess, error) {
 	holders, err := table.holdersOf(lockPath)
 	if err != nil {
 		return nil, fmt.Errorf("find the process holding %s: %w", lockPath, err)
@@ -101,7 +116,17 @@ func releaseThreadWriterLock(table processTable, lockPath string, ownPID int, wa
 				return nil, fmt.Errorf("%s holds %s and runs under this wrapper; not stopping it", holder, lockPath)
 			}
 			if current.isBridgeWrapper() {
-				return nil, fmt.Errorf("%s holds %s and belongs to another bridge session (wrapper pid %d); not stopping it", holder, lockPath, current.pid)
+				wrapperSessionID, set, err := table.environmentValue(current.pid, bridgeSessionIDEnvironmentVariable)
+				if err != nil {
+					return nil, fmt.Errorf("%s holds %s under bridge wrapper pid %d, whose session could not be read: %w; not stopping it", holder, lockPath, current.pid, err)
+				}
+				if !set || ownBridgeSessionID == "" || wrapperSessionID != ownBridgeSessionID {
+					return nil, fmt.Errorf("%s holds %s and belongs to another bridge session (wrapper pid %d, session %q); not stopping it", holder, lockPath, current.pid, wrapperSessionID)
+				}
+				if current.pid != holder.pid {
+					chain = append(chain, current)
+				}
+				break
 			}
 			if current.parentPID <= 1 {
 				break
@@ -224,6 +249,19 @@ func (procProcessTable) process(pid int) (codexProcess, error) {
 		parentPID: parentPID,
 		arguments: strings.Split(strings.TrimRight(string(commandLine), "\x00"), "\x00"),
 	}, nil
+}
+
+func (procProcessTable) environmentValue(pid int, name string) (string, bool, error) {
+	environment, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		return "", false, err
+	}
+	for _, entry := range strings.Split(string(environment), "\x00") {
+		if value, found := strings.CutPrefix(entry, name+"="); found {
+			return value, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 func (procProcessTable) signal(pid int, signal syscall.Signal) error {

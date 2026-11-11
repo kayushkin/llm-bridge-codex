@@ -50,3 +50,37 @@ func TestProcProcessTableFindsTheProcessHoldingAFile(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// The /proc reader reads a real process's session id from its environment,
+// and tells a variable that is unset from one that is empty.
+func TestProcProcessTableReadsAProcessEnvironmentVariable(t *testing.T) {
+	if _, err := os.Stat("/proc/self/environ"); err != nil {
+		t.Skip("no /proc")
+	}
+	child := exec.Command("sleep", "30")
+	child.Env = []string{bridgeSessionIDEnvironmentVariable + "=br_live", "EMPTY_VARIABLE="}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { child.Process.Kill(); child.Wait() })
+	// Until the child execs sleep, /proc shows the test's own environment.
+	table := procProcessTable{}
+	var value string
+	var set bool
+	var err error
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		value, set, err = table.environmentValue(child.Process.Pid, bridgeSessionIDEnvironmentVariable)
+		if err != nil || set {
+			break
+		}
+	}
+	if err != nil || !set || value != "br_live" {
+		t.Fatalf("environmentValue = %q, %v, %v; want br_live, set", value, set, err)
+	}
+	if value, set, err := table.environmentValue(child.Process.Pid, "EMPTY_VARIABLE"); err != nil || !set || value != "" {
+		t.Fatalf("EMPTY_VARIABLE = %q, %v, %v; want empty and set", value, set, err)
+	}
+	if _, set, err := table.environmentValue(child.Process.Pid, "NOT_SET_ANYWHERE"); err != nil || set {
+		t.Fatalf("NOT_SET_ANYWHERE: set=%v err=%v; want unset", set, err)
+	}
+}

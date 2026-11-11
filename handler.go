@@ -23,6 +23,9 @@ type Bridge struct {
 	bridgeID string // server-assigned bridge_session_id (stable PK)
 	clientID string // frontend correlation key
 	threadID string // current Codex thread ID — the harness_session_id; rotates on resume/fork
+	// resumeFailure is why the last resume left the session with no thread,
+	// so a later message says why it cannot run instead of "no active thread".
+	resumeFailure error
 	turnDone chan struct{}
 	emit     func(msg.Event)
 }
@@ -571,7 +574,7 @@ func (b *Bridge) HandleStart(ctx context.Context, params StartParams) error {
 // HandleMessage sends a follow-up message to the existing thread.
 func (b *Bridge) HandleMessage(ctx context.Context, content string) error {
 	if b.threadID == "" {
-		return fmt.Errorf("no active thread")
+		return b.noActiveThreadError()
 	}
 	return b.startTurn(ctx, content)
 }
@@ -579,7 +582,7 @@ func (b *Bridge) HandleMessage(ctx context.Context, content string) error {
 // HandleResume resumes a previously interrupted thread by sending a continuation prompt.
 func (b *Bridge) HandleResume(ctx context.Context) error {
 	if b.threadID == "" {
-		return fmt.Errorf("no active thread")
+		return b.noActiveThreadError()
 	}
 	return b.startTurn(ctx, "Continue where you left off.")
 }
@@ -630,7 +633,23 @@ func threadToResume(state *State, bridgeSessionID string, params StartParams) (s
 // Codex mints a new thread_id on resume; we record (bridge_session_id, new
 // thread_id) under WAL so the chain survives bridge crashes — exactly the
 // stub-rollout case that motivated this design.
-func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) error {
+// noActiveThreadError is the error for a request that needs a thread when
+// there is none, naming the failed resume that left it so when there was one.
+func (b *Bridge) noActiveThreadError() error {
+	if b.resumeFailure != nil {
+		return fmt.Errorf("no active thread: resuming the conversation failed, so this message cannot run; start the session again to retry the resume: %w", b.resumeFailure)
+	}
+	return fmt.Errorf("no active thread")
+}
+
+func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) (resumeError error) {
+	defer func() {
+		if resumeError != nil && b.threadID == "" {
+			b.resumeFailure = resumeError
+		} else if resumeError == nil {
+			b.resumeFailure = nil
+		}
+	}()
 	// applyStartConfig must run before ensureAppServer so per-session
 	// app-server args (codex_hooks, disable_network, disabled_tools) are
 	// populated on b.cfg before the spawn.
@@ -648,7 +667,7 @@ func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) err
 	newID, err := b.recordChain("resume", parent, seq, func() (string, error) {
 		result, err := b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: parent})
 		if err != nil && strings.Contains(err.Error(), codexActiveWriterRefusal) {
-			if releaseErr := b.closeCodexTerminalHoldingThread(parent); releaseErr != nil {
+			if releaseErr := b.closeCodexHoldingThread(parent); releaseErr != nil {
 				return "", fmt.Errorf("thread/resume: %w; and could not close the codex holding it: %v", err, releaseErr)
 			}
 			result, err = b.codex.ThreadResume(ctx, &ThreadResumeParams{ThreadID: parent})
@@ -677,28 +696,38 @@ func (b *Bridge) HandleResumeThread(ctx context.Context, params StartParams) err
 	return b.startTurn(ctx, params.Prompt)
 }
 
-// closeCodexTerminalHoldingThread stops the codex terminal that has the thread
-// open, so this session can resume it, and says so in the session's chat. A
-// codex terminal hands its threads to codex's shared background app-server,
-// which keeps the thread's writer lock while the terminal runs; codex then
-// refuses this session's resume with "already has an active writer".
-func (b *Bridge) closeCodexTerminalHoldingThread(threadID string) error {
+// closeCodexHoldingThread stops the codex that has the thread open, so this
+// session can resume it, and says so in the session's chat. Codex refuses the
+// resume with "already has an active writer" while another codex writes the
+// thread. That is either a codex terminal, which hands its threads to codex's
+// shared background app-server, or this session's own wrapper from before
+// llm-bridge-server restarted, still running with its app-server.
+func (b *Bridge) closeCodexHoldingThread(threadID string) error {
 	codexHome, err := codexHomeDirectory()
 	if err != nil {
 		return err
 	}
-	stopped, err := releaseThreadWriterLock(procProcessTable{}, threadWriterLockPath(codexHome, threadID), os.Getpid(), 10*time.Second)
+	stopped, err := releaseThreadWriterLock(procProcessTable{}, threadWriterLockPath(codexHome, threadID), os.Getpid(), b.bridgeID, 10*time.Second)
 	if err != nil {
 		return err
 	}
 	names := make([]string, len(stopped))
+	leftoverWrapper := false
 	for index, process := range stopped {
 		names[index] = process.String()
+		if process.isBridgeWrapper() {
+			leftoverWrapper = true
+		}
 	}
+	subtype := "codex_terminal_closed"
 	notice := fmt.Sprintf("A codex terminal on this machine had this conversation open, so codex would not let the session continue it. Closed it: %s.", strings.Join(names, "; "))
+	if leftoverWrapper {
+		subtype = "codex_leftover_wrapper_closed"
+		notice = fmt.Sprintf("This session's codex from before the bridge restarted was still running and had the conversation open, so codex would not let the session continue it. Stopped it: %s.", strings.Join(names, "; "))
+	}
 	log.Printf("[bridge] %s", notice)
 	event := b.event(msg.EventSystem)
-	event.System = &msg.SystemEvent{Subtype: "codex_terminal_closed", Message: notice}
+	event.System = &msg.SystemEvent{Subtype: subtype, Message: notice}
 	b.emit(event)
 	return nil
 }
@@ -706,7 +735,7 @@ func (b *Bridge) closeCodexTerminalHoldingThread(threadID string) error {
 // HandleCompact triggers context compaction on the thread.
 func (b *Bridge) HandleCompact(ctx context.Context) error {
 	if b.threadID == "" {
-		return fmt.Errorf("no active thread")
+		return b.noActiveThreadError()
 	}
 	return b.codex.ThreadCompactStart(ctx, &ThreadCompactParams{ThreadID: b.threadID})
 }

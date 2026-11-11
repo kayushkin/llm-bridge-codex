@@ -12,10 +12,13 @@ import (
 // diesOn (SIGTERM unless set), and the lock is free once its holders are dead.
 type fakeProcessTable struct {
 	processes map[int]codexProcess
-	holders   []int
-	diesOn    map[int]syscall.Signal
-	dead      map[int]bool
-	signals   []string
+	// environments holds each process's environment variables; a process
+	// with no entry has none set.
+	environments map[int]map[string]string
+	holders      []int
+	diesOn       map[int]syscall.Signal
+	dead         map[int]bool
+	signals      []string
 }
 
 func (table *fakeProcessTable) holdersOf(string) ([]int, error) {
@@ -34,6 +37,14 @@ func (table *fakeProcessTable) process(pid int) (codexProcess, error) {
 		return codexProcess{}, fmt.Errorf("no process %d", pid)
 	}
 	return process, nil
+}
+
+func (table *fakeProcessTable) environmentValue(pid int, name string) (string, bool, error) {
+	if _, found := table.processes[pid]; !found {
+		return "", false, fmt.Errorf("no process %d", pid)
+	}
+	value, set := table.environments[pid][name]
+	return value, set, nil
 }
 
 func (table *fakeProcessTable) signal(pid int, signal syscall.Signal) error {
@@ -65,6 +76,9 @@ func laptopProcessTree() *fakeProcessTable {
 			340992: {pid: 340992, parentPID: 261431, arguments: []string{"/home/user/bin/llm-bridge-codex"}},
 			341002: {pid: 341002, parentPID: 340992, arguments: []string{"codex", "app-server", "--listen", "ws://127.0.0.1:44551"}},
 		},
+		environments: map[int]map[string]string{
+			340992: {bridgeSessionIDEnvironmentVariable: "br_other"},
+		},
 		holders: []int{237812},
 		diesOn:  map[int]syscall.Signal{},
 		dead:    map[int]bool{},
@@ -83,7 +97,7 @@ func stoppedPIDs(stopped []codexProcess) []int {
 // first, and the shell above them does not.
 func TestReleaseThreadWriterLockClosesTheCodexTerminalAboveTheBackgroundServer(t *testing.T) {
 	table := laptopProcessTree()
-	stopped, err := releaseThreadWriterLock(table, "/lock", 340992, time.Second)
+	stopped, err := releaseThreadWriterLock(table, "/lock", 340992, "br_current", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +116,7 @@ func TestReleaseThreadWriterLockClosesTheCodexTerminalAboveTheBackgroundServer(t
 func TestReleaseThreadWriterLockKillsAHolderThatIgnoresSIGTERM(t *testing.T) {
 	table := laptopProcessTree()
 	table.diesOn[237812] = syscall.SIGKILL
-	if _, err := releaseThreadWriterLock(table, "/lock", 340992, 200*time.Millisecond); err != nil {
+	if _, err := releaseThreadWriterLock(table, "/lock", 340992, "br_current", 200*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(strings.Join(table.signals, " "), "237812:9") {
@@ -114,7 +128,7 @@ func TestReleaseThreadWriterLockKillsAHolderThatIgnoresSIGTERM(t *testing.T) {
 func TestReleaseThreadWriterLockLeavesAnotherBridgeSessionsCodexAlone(t *testing.T) {
 	table := laptopProcessTree()
 	table.holders = []int{341002}
-	_, err := releaseThreadWriterLock(table, "/lock", 999, time.Second)
+	_, err := releaseThreadWriterLock(table, "/lock", 999, "br_current", time.Second)
 	if err == nil || !strings.Contains(err.Error(), "another bridge session") {
 		t.Fatalf("err = %v, want a refusal naming another bridge session", err)
 	}
@@ -127,7 +141,7 @@ func TestReleaseThreadWriterLockLeavesAnotherBridgeSessionsCodexAlone(t *testing
 func TestReleaseThreadWriterLockFailsWhenNoProcessHoldsTheLock(t *testing.T) {
 	table := laptopProcessTree()
 	table.holders = nil
-	if _, err := releaseThreadWriterLock(table, "/lock", 340992, time.Second); err == nil {
+	if _, err := releaseThreadWriterLock(table, "/lock", 340992, "br_current", time.Second); err == nil {
 		t.Fatal("want an error when no process holds the lock")
 	}
 }
@@ -136,7 +150,68 @@ func TestReleaseThreadWriterLockFailsWhenNoProcessHoldsTheLock(t *testing.T) {
 func TestReleaseThreadWriterLockLeavesAHolderThatIsNotCodexAlone(t *testing.T) {
 	table := laptopProcessTree()
 	table.holders = []int{11}
-	if _, err := releaseThreadWriterLock(table, "/lock", 340992, time.Second); err == nil || len(table.signals) != 0 {
+	if _, err := releaseThreadWriterLock(table, "/lock", 340992, "br_current", time.Second); err == nil || len(table.signals) != 0 {
+		t.Fatalf("err = %v, signals %v; want a refusal and no signal", err, table.signals)
+	}
+}
+
+// The tree measured on a laptop on 2026-11-10 after an agent restarted
+// llm-bridge-server mid-turn: the old wrapper (965267) of session br_same ran
+// on, orphaned, with its app-server (965275) still holding the lock, and the
+// server's new wrapper for br_same (970000) could not resume the thread.
+func restartedBridgeProcessTree() *fakeProcessTable {
+	return &fakeProcessTable{
+		processes: map[int]codexProcess{
+			965267: {pid: 965267, parentPID: 1, arguments: []string{"/home/user/bin/llm-bridge-codex"}},
+			965275: {pid: 965275, parentPID: 965267, arguments: []string{"codex", "app-server", "--listen", "ws://127.0.0.1:46879"}},
+			970001: {pid: 970001, parentPID: 1, arguments: []string{"/home/user/bin/llm-bridge-server"}},
+			970000: {pid: 970000, parentPID: 970001, arguments: []string{"/home/user/bin/llm-bridge-codex"}},
+			970010: {pid: 970010, parentPID: 970000, arguments: []string{"codex", "app-server", "--listen", "ws://127.0.0.1:47001"}},
+		},
+		environments: map[int]map[string]string{
+			965267: {bridgeSessionIDEnvironmentVariable: "br_same"},
+			970000: {bridgeSessionIDEnvironmentVariable: "br_same"},
+		},
+		holders: []int{965275},
+		diesOn:  map[int]syscall.Signal{},
+		dead:    map[int]bool{},
+	}
+}
+
+// This session's own leftover wrapper holds the thread after a bridge restart:
+// stop it and its app-server, wrapper first, and nothing of the new wrapper.
+func TestReleaseThreadWriterLockStopsThisSessionsLeftoverWrapperFromBeforeARestart(t *testing.T) {
+	table := restartedBridgeProcessTree()
+	stopped, err := releaseThreadWriterLock(table, "/lock", 970000, "br_same", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(stoppedPIDs(stopped)); got != "[965267 965275]" {
+		t.Fatalf("stopped %s, want [965267 965275]", got)
+	}
+	if table.dead[970000] || table.dead[970010] || table.dead[970001] {
+		t.Fatalf("stopped part of the new wrapper's tree: signals %v", table.signals)
+	}
+}
+
+// The same tree, but the leftover wrapper is another session's: stop nothing.
+func TestReleaseThreadWriterLockLeavesALeftoverWrapperOfAnotherSessionAlone(t *testing.T) {
+	table := restartedBridgeProcessTree()
+	_, err := releaseThreadWriterLock(table, "/lock", 970000, "br_different", time.Second)
+	if err == nil || !strings.Contains(err.Error(), "another bridge session") || !strings.Contains(err.Error(), "br_same") {
+		t.Fatalf("err = %v, want a refusal naming session br_same", err)
+	}
+	if len(table.signals) != 0 {
+		t.Fatalf("sent %v", table.signals)
+	}
+}
+
+// A wrapper with no session id set cannot be shown to be this session's: stop
+// nothing.
+func TestReleaseThreadWriterLockLeavesAWrapperWithNoSessionIDAlone(t *testing.T) {
+	table := restartedBridgeProcessTree()
+	delete(table.environments, 965267)
+	if _, err := releaseThreadWriterLock(table, "/lock", 970000, "br_same", time.Second); err == nil || len(table.signals) != 0 {
 		t.Fatalf("err = %v, signals %v; want a refusal and no signal", err, table.signals)
 	}
 }
